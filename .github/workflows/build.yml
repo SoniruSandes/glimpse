@@ -1,0 +1,86 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-x64,   os: windows-latest,   target: x86_64-pc-windows-msvc,    pdfium: "" }
+          - { name: windows-arm64, os: windows-latest,   target: aarch64-pc-windows-msvc,   pdfium: "" }
+          - { name: linux-x64,     os: ubuntu-22.04,     target: x86_64-unknown-linux-gnu,  pdfium: pdfium-linux-x64 }
+          - { name: linux-arm64,   os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, pdfium: pdfium-linux-arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config \
+            libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
+            libxkbcommon-dev libwayland-dev libx11-dev
+
+      # If the RAR library (C++) fails to build on a target, add: --no-default-features
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "dist/quicklook-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/quicklook.exe $dir
+          Copy-Item README.md $dir
+          Compress-Archive -Path $dir -DestinationPath "dist/quicklook-${{ matrix.name }}.zip"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          dir=dist/quicklook-${{ matrix.name }}
+          mkdir -p "$dir"
+          cp target/${{ matrix.target }}/release/quicklook "$dir/"
+          cp README.md "$dir/"
+          # PDF on Linux uses pdfium, loaded at run time from next to the executable.
+          curl -fsSL "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/${{ matrix.pdfium }}.tgz" -o pdfium.tgz
+          mkdir pdfium && tar -xzf pdfium.tgz -C pdfium
+          cp pdfium/lib/libpdfium.so "$dir/"
+          tar -czf "dist/quicklook-${{ matrix.name }}.tar.gz" -C dist "quicklook-${{ matrix.name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quicklook-${{ matrix.name }}
+          path: dist/quicklook-${{ matrix.name }}.*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
