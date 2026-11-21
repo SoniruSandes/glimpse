@@ -4,6 +4,10 @@
 //! callback, so there are no extra rendering dependencies and large meshes stay smooth. GL objects are created
 //! lazily on the first paint (the callback is the only place that has the GL context) and freed on drop.
 //!
+//! Textures are optional: a model's own textures (OBJ/MTL `map_Kd`, glTF base colour) are used when the files are
+//! found, and the "Textures" button in the status bar (or dropping images / a folder on the window) lets the user
+//! supply their own. Only the colour / diffuse image is used (no normal / roughness maps), to stay light.
+//!
 //! Controls (see `HELP` for the list shown with H): left-drag orbit, right/middle/Shift-drag pan, wheel zoom,
 //! arrow keys, +/-, R reset, 1/3/7 views, W wireframe, G grid, O ortho, Z up-axis, T turntable.
 
@@ -11,8 +15,12 @@ use std::{
     collections::HashMap,
     f32::consts::{FRAC_PI_2, PI},
     hash::{BuildHasherDefault, Hasher},
-    path::Path,
-    sync::{Arc, Mutex},
+    path::{Path, PathBuf},
+    sync::{
+        mpsc::{self, Receiver, Sender, TryRecvError},
+        Arc, Mutex,
+    },
+    thread,
 };
 
 use eframe::{
@@ -157,22 +165,57 @@ fn transform_dir(m: &M4, p: V3) -> V3 {
 // Mesh + loaders (run off the UI thread)
 // ------------------------------------------------------------------------------------------
 
+/// One texture the model refers to (OBJ material / glTF image). `image` is filled when the file was found
+/// next to the model or embedded in it; the user can supply it afterwards.
+pub struct Slot {
+    name: String,
+    image: Option<ImageData>,
+}
+
+#[derive(Clone)]
+pub struct ImageData {
+    w: u32,
+    h: u32,
+    rgba: Vec<u8>,
+}
+
+/// A run of indices drawn with one texture slot.
+#[derive(Clone, Copy)]
+struct Part {
+    first: u32,
+    count: u32,
+    slot: Option<usize>,
+}
+
 #[derive(Default)]
 pub struct Mesh {
     pos: Vec<V3>,
     nrm: Vec<V3>,
     col: Vec<V3>,
+    /// Texture coordinates in image space (0,0 = top-left), same length as `pos` when present.
+    uv: Vec<[f32; 2]>,
     idx: Vec<u32>,
+    parts: Vec<Part>,
 }
 
 impl Mesh {
     /// Append one triangle batch. Missing normals are computed (smooth). `color` multiplies the vertex colours.
-    fn add(&mut self, pos: &[V3], nrm: Option<&[V3]>, vcol: Option<&[V3]>, color: V3, idx: &[u32]) -> Result<(), String> {
+    fn add(
+        &mut self,
+        pos: &[V3],
+        nrm: Option<&[V3]>,
+        vcol: Option<&[V3]>,
+        color: V3,
+        uv: Option<&[[f32; 2]]>,
+        slot: Option<usize>,
+        idx: &[u32],
+    ) -> Result<(), String> {
         let idx = &idx[..idx.len() / 3 * 3];
         if idx.iter().any(|&i| i as usize >= pos.len()) {
             return Err("The file refers to vertices that don't exist".into());
         }
         let base = self.pos.len() as u32;
+        let first = self.idx.len() as u32;
         let computed;
         let nrm: &[V3] = match nrm {
             Some(n) if n.len() == pos.len() => n,
@@ -189,8 +232,58 @@ impl Mesh {
             }
             _ => self.col.extend(std::iter::repeat(color).take(pos.len())),
         }
+        match uv {
+            Some(t) if t.len() == pos.len() => self.uv.extend_from_slice(t),
+            _ => self.uv.extend(std::iter::repeat([0.0f32; 2]).take(pos.len())),
+        }
         self.idx.extend(idx.iter().map(|i| i + base));
+        let count = self.idx.len() as u32 - first;
+        match self.parts.last_mut() {
+            Some(last) if last.slot == slot && last.first + last.count == first => last.count += count,
+            _ => self.parts.push(Part { first, count, slot }),
+        }
         Ok(())
+    }
+}
+
+/// Texture slots found while loading, de-duplicated by name / image index.
+#[derive(Default)]
+struct Slots {
+    list: Vec<Slot>,
+    by_key: HashMap<String, usize>,
+    unnamed: Option<usize>,
+}
+
+const MAX_SLOTS: usize = 64;
+/// Textures the model points at are decoded while loading, but only for the first few materials.
+const AUTO_DECODE_MAX: usize = 8;
+
+impl Slots {
+    fn named(&mut self, key: String, make: impl FnOnce(bool) -> Slot) -> Option<usize> {
+        if let Some(&i) = self.by_key.get(&key) {
+            return Some(i);
+        }
+        if self.list.len() >= MAX_SLOTS {
+            return None;
+        }
+        let decode = self.list.len() < AUTO_DECODE_MAX;
+        self.list.push(make(decode));
+        let i = self.list.len() - 1;
+        self.by_key.insert(key, i);
+        Some(i)
+    }
+
+    /// For meshes that have texture coordinates but name no texture: the user's texture can still go here.
+    fn unnamed(&mut self) -> Option<usize> {
+        if self.unnamed.is_some() {
+            return self.unnamed;
+        }
+        if self.list.len() >= MAX_SLOTS {
+            return None;
+        }
+        self.list.push(Slot { name: String::new(), image: None });
+        self.unnamed = Some(self.list.len() - 1);
+        self.unnamed
     }
 }
 
@@ -221,6 +314,8 @@ pub struct ModelData {
     flat: bool,
     /// No faces: draw the vertices as points (PLY scans / point clouds).
     points: bool,
+    /// Textures the model refers to (empty when it has no texture coordinates).
+    slots: Vec<Slot>,
 }
 
 pub fn load(path: &Path) -> Result<ModelData, String> {
@@ -263,20 +358,57 @@ fn load_obj(path: &Path) -> Result<ModelData, String> {
     };
     let (models, materials) = tobj::load_obj(path, &options).map_err(|e| e.to_string())?;
     let materials = materials.unwrap_or_default(); // a missing .mtl just means "no colours"
+    let dir = path.parent();
     let mut mesh = Mesh::default();
+    let mut slots = Slots::default();
     for model in &models {
         let m = &model.mesh;
         let pos: Vec<V3> = m.positions.chunks_exact(3).map(|p| [p[0], p[1], p[2]]).collect();
         let nrm: Vec<V3> = m.normals.chunks_exact(3).map(|p| [p[0], p[1], p[2]]).collect();
-        let color = m
-            .material_id
-            .and_then(|i| materials.get(i))
+        let material = m.material_id.and_then(|i| materials.get(i));
+        let color = material
             .and_then(|mat| mat.diffuse)
             .filter(|d| d[0] + d[1] + d[2] > 0.03) // black "Kd" is almost always an export accident
             .unwrap_or(DEFAULT_COLOR);
-        mesh.add(&pos, (!nrm.is_empty()).then_some(nrm.as_slice()), None, color, &m.indices)?;
+
+        // Texture coordinates (OBJ has v pointing up; we keep image space, so flip v).
+        let has_uv = !pos.is_empty() && m.texcoords.len() == pos.len() * 2;
+        let uv: Vec<[f32; 2]> = if has_uv { m.texcoords.chunks_exact(2).map(|t| [t[0], 1.0 - t[1]]).collect() } else { Vec::new() };
+        let tex_name = material
+            .and_then(|mat| mat.diffuse_texture.as_deref())
+            .map(clean_tex_name)
+            .filter(|n| !n.is_empty());
+        let slot = if !has_uv {
+            None
+        } else {
+            match tex_name {
+                Some(name) => {
+                    let key = name.to_ascii_lowercase();
+                    slots.named(key, |decode| {
+                        let image = if decode {
+                            dir.map(|d| d.join(name.replace('\\', "/"))).and_then(|p| decode_file(&p).ok())
+                        } else {
+                            None
+                        };
+                        Slot { name: name.clone(), image }
+                    })
+                }
+                None => slots.unnamed(),
+            }
+        };
+        mesh.add(&pos, (!nrm.is_empty()).then_some(nrm.as_slice()), None, color, has_uv.then_some(uv.as_slice()), slot, &m.indices)?;
     }
-    Ok(ModelData { mesh, format: "OBJ", zup: false, flat: false, points: false })
+    Ok(ModelData { mesh, format: "OBJ", zup: false, flat: false, points: false, slots: slots.list })
+}
+
+/// `map_Kd -s 1 1 1 wood.png` -> `wood.png` (MTL options come first, the file name is last).
+fn clean_tex_name(s: &str) -> String {
+    let s = s.trim();
+    if s.starts_with('-') {
+        s.split_whitespace().last().unwrap_or("").to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 // ---- STL (binary and ASCII) ----
@@ -351,8 +483,8 @@ fn load_stl(path: &Path) -> Result<ModelData, String> {
         idx.push(id);
     }
     let n = pos.len();
-    let mesh = Mesh { pos, nrm: vec![[0.0; 3]; n], col: vec![DEFAULT_COLOR; n], idx };
-    Ok(ModelData { mesh, format: "STL", zup: true, flat: true, points: false })
+    let mesh = Mesh { pos, nrm: vec![[0.0; 3]; n], col: vec![DEFAULT_COLOR; n], idx, ..Default::default() };
+    Ok(ModelData { mesh, format: "STL", zup: true, flat: true, points: false, slots: Vec::new() })
 }
 
 // ---- PLY (ascii, binary little/big endian; vertices, optional normals + colours, polygon faces) ----
@@ -603,10 +735,18 @@ fn load_ply(path: &Path) -> Result<ModelData, String> {
         mesh.nrm = vec![[0.0, 1.0, 0.0]; n];
         mesh.col = if has_c { col } else { vec![DEFAULT_COLOR; n] };
         mesh.pos = pos;
-        return Ok(ModelData { mesh, format: "PLY", zup: false, flat: false, points: true });
+        return Ok(ModelData { mesh, format: "PLY", zup: false, flat: false, points: true, slots: Vec::new() });
     }
-    mesh.add(&pos, has_n.then_some(nrm.as_slice()), has_c.then_some(col.as_slice()), if has_c { [1.0; 3] } else { DEFAULT_COLOR }, &idx)?;
-    Ok(ModelData { mesh, format: "PLY", zup: false, flat: false, points: false })
+    mesh.add(
+        &pos,
+        has_n.then_some(nrm.as_slice()),
+        has_c.then_some(col.as_slice()),
+        if has_c { [1.0; 3] } else { DEFAULT_COLOR },
+        None,
+        None,
+        &idx,
+    )?;
+    Ok(ModelData { mesh, format: "PLY", zup: false, flat: false, points: false, slots: Vec::new() })
 }
 
 // ---- glTF / GLB (geometry + base colour only; textures are skipped to stay light) ----
@@ -630,11 +770,97 @@ fn flatten(m: [[f32; 4]; 4]) -> M4 {
     r
 }
 
-fn add_gltf_mesh(gm: &gltf::Mesh, m: &M4, buffers: &[gltf::buffer::Data], mesh: &mut Mesh) -> Result<(), String> {
+struct GltfCtx<'a> {
+    buffers: &'a [gltf::buffer::Data],
+    base: Option<&'a Path>,
+    slots: Slots,
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Some(v) = std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.bytes() {
+        let v = (match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b' ' | b'\n' | b'\r' | b'\t' => continue,
+            _ => return None,
+        }) as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// The glTF image behind a base-colour texture: embedded (GLB / buffer view), a `data:` URI or a file next to the model.
+fn gltf_slot(img: &gltf::Image, base: Option<&Path>, buffers: &[gltf::buffer::Data], decode: bool) -> Slot {
+    use gltf::image::Source;
+    let (name, image) = match img.source() {
+        Source::View { view, .. } => {
+            let image = if decode {
+                let start = view.offset();
+                buffers
+                    .get(view.buffer().index())
+                    .and_then(|b| b.get(start..start + view.length()))
+                    .and_then(|bytes| decode_bytes(bytes).ok())
+            } else {
+                None
+            };
+            (img.name().unwrap_or("").to_string(), image)
+        }
+        Source::Uri { uri, .. } => {
+            if let Some(rest) = uri.strip_prefix("data:") {
+                let image = if decode {
+                    rest.split_once(',')
+                        .filter(|(head, _)| head.contains("base64"))
+                        .and_then(|(_, data)| base64_decode(data))
+                        .and_then(|bytes| decode_bytes(&bytes).ok())
+                } else {
+                    None
+                };
+                (img.name().unwrap_or("").to_string(), image)
+            } else {
+                let decoded = percent_decode(uri);
+                let image = if decode { base.and_then(|d| decode_file(&d.join(&decoded)).ok()) } else { None };
+                (decoded, image)
+            }
+        }
+    };
+    Slot { name, image }
+}
+
+fn add_gltf_mesh(gm: &gltf::Mesh, m: &M4, ctx: &mut GltfCtx, mesh: &mut Mesh) -> Result<(), String> {
     for prim in gm.primitives() {
         if prim.mode() != gltf::mesh::Mode::Triangles {
             continue;
         }
+        let buffers = ctx.buffers;
         let reader = prim.reader(|b| Some(&buffers[b.index()]));
         let Some(positions) = reader.read_positions() else { continue };
         let pos: Vec<V3> = positions.map(|p| transform_point(m, p)).collect();
@@ -648,22 +874,41 @@ fn add_gltf_mesh(gm: &gltf::Mesh, m: &M4, buffers: &[gltf::buffer::Data], mesh: 
                 .map(|c| [lin_to_srgb(c[0]), lin_to_srgb(c[1]), lin_to_srgb(c[2])])
                 .collect()
         });
-        let f = prim.material().pbr_metallic_roughness().base_color_factor();
+        let material = prim.material();
+        let pbr = material.pbr_metallic_roughness();
+        let f = pbr.base_color_factor();
         // 0.92: a textured model usually has a pure-white factor; that would glare without its texture.
         let color = [lin_to_srgb(f[0]) * 0.92, lin_to_srgb(f[1]) * 0.92, lin_to_srgb(f[2]) * 0.92];
-        mesh.add(&pos, nrm.as_deref(), vcol.as_deref(), color, &idx)?;
+
+        // Base-colour texture (only this map is used).
+        let info = pbr.base_color_texture();
+        let set = info.as_ref().map(|i| i.tex_coord()).unwrap_or(0);
+        let uv: Option<Vec<[f32; 2]>> = reader.read_tex_coords(set).map(|t| t.into_f32().collect());
+        let slot = if uv.is_none() {
+            None
+        } else {
+            match &info {
+                Some(i) => {
+                    let img = i.texture().source();
+                    let (base, bufs) = (ctx.base, ctx.buffers);
+                    ctx.slots.named(format!("img{}", img.index()), |decode| gltf_slot(&img, base, bufs, decode))
+                }
+                None => ctx.slots.unnamed(),
+            }
+        };
+        mesh.add(&pos, nrm.as_deref(), vcol.as_deref(), color, uv.as_deref(), slot, &idx)?;
     }
     Ok(())
 }
 
-fn visit(node: gltf::Node, parent: &M4, buffers: &[gltf::buffer::Data], mesh: &mut Mesh, depth: u32) -> Result<(), String> {
+fn visit(node: gltf::Node, parent: &M4, ctx: &mut GltfCtx, mesh: &mut Mesh, depth: u32) -> Result<(), String> {
     let m = mul(parent, &flatten(node.transform().matrix()));
     if let Some(gm) = node.mesh() {
-        add_gltf_mesh(&gm, &m, buffers, mesh)?;
+        add_gltf_mesh(&gm, &m, ctx, mesh)?;
     }
     if depth < 64 {
         for child in node.children() {
-            visit(child, &m, buffers, mesh, depth + 1)?;
+            visit(child, &m, ctx, mesh, depth + 1)?;
         }
     }
     Ok(())
@@ -673,23 +918,212 @@ fn load_gltf(path: &Path) -> Result<ModelData, String> {
     let gltf::Gltf { document, blob } = gltf::Gltf::open(path).map_err(|e| e.to_string())?;
     let buffers = gltf::import_buffers(&document, path.parent(), blob).map_err(|e| e.to_string())?;
     let mut mesh = Mesh::default();
+    let mut ctx = GltfCtx { buffers: &buffers, base: path.parent(), slots: Slots::default() };
     let id = identity();
     match document.default_scene().or_else(|| document.scenes().next()) {
         Some(scene) => {
             for node in scene.nodes() {
-                visit(node, &id, &buffers, &mut mesh, 0)?;
+                visit(node, &id, &mut ctx, &mut mesh, 0)?;
             }
         }
         None => {
             for gm in document.meshes() {
-                add_gltf_mesh(&gm, &id, &buffers, &mut mesh)?;
+                add_gltf_mesh(&gm, &id, &mut ctx, &mut mesh)?;
             }
         }
     }
     if mesh.pos.is_empty() {
         return Err("No triangle meshes found (Draco / meshopt-compressed glTF isn't supported)".into());
     }
-    Ok(ModelData { mesh, format: "glTF", zup: false, flat: false, points: false })
+    Ok(ModelData { mesh, format: "glTF", zup: false, flat: false, points: false, slots: ctx.slots.list })
+}
+
+// ------------------------------------------------------------------------------------------
+// Textures: decoding, matching a texture folder / files to the model's materials
+// ------------------------------------------------------------------------------------------
+
+pub const TEX_EXTS: &[&str] = &["png", "jpg", "jpeg", "tga", "bmp", "tif", "tiff", "webp", "gif"];
+/// Textures are shrunk to fit this (GPU memory and upload time; plenty for a preview).
+const TEX_MAX: u32 = 2048;
+
+fn finish_image(img: image::DynamicImage) -> ImageData {
+    let img = if img.width() > TEX_MAX || img.height() > TEX_MAX {
+        img.resize(TEX_MAX, TEX_MAX, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let rgba = img.to_rgba8();
+    ImageData { w: rgba.width(), h: rgba.height(), rgba: rgba.into_raw() }
+}
+
+fn open_reader(path: &Path) -> Result<image::ImageReader<std::io::BufReader<std::fs::File>>, String> {
+    image::ImageReader::open(path)
+        .map_err(|e| e.to_string())?
+        .with_guessed_format()
+        .map_err(|e| e.to_string())
+}
+
+fn decode_file(path: &Path) -> Result<ImageData, String> {
+    let (w, h) = open_reader(path)?.into_dimensions().map_err(|e| e.to_string())?;
+    if w as u64 * h as u64 > 80_000_000 {
+        return Err("Texture is too large".into());
+    }
+    let img = open_reader(path)?.decode().map_err(|e| e.to_string())?;
+    Ok(finish_image(img))
+}
+
+fn decode_bytes(bytes: &[u8]) -> Result<ImageData, String> {
+    let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
+    Ok(finish_image(img))
+}
+
+fn is_texture_file(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map_or(false, |e| TEX_EXTS.iter().any(|x| e.eq_ignore_ascii_case(x)))
+}
+
+fn walk_textures(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
+    if depth > 4 || out.len() > 5000 {
+        return;
+    }
+    let Ok(read) = std::fs::read_dir(dir) else { return };
+    for entry in read.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            walk_textures(&p, depth + 1, out);
+        } else if is_texture_file(&p) {
+            out.push(p);
+        }
+    }
+}
+
+/// Files, plus everything image-like inside folders (texture packs often have sub-folders).
+fn collect_pool(inputs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for p in inputs {
+        if p.is_dir() {
+            walk_textures(p, 0, &mut out);
+        } else if is_texture_file(p) {
+            out.push(p.clone());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out.truncate(5000);
+    out
+}
+
+/// Lower-case file name without any directory (works for both / and \ paths).
+fn norm_name(s: &str) -> String {
+    s.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(s).to_ascii_lowercase()
+}
+
+fn stem_of(name: &str) -> &str {
+    name.rsplit_once('.').map_or(name, |(stem, _)| stem)
+}
+
+/// The picked image a material refers to: same file name, else same name with another extension (.tga vs .png).
+fn resolve<'a>(name: &str, pool: &'a [PathBuf]) -> Option<&'a PathBuf> {
+    let want = norm_name(name);
+    let file = |p: &PathBuf| p.file_name().and_then(|n| n.to_str()).map(|n| n.to_ascii_lowercase()).unwrap_or_default();
+    pool.iter().find(|p| file(p) == want).or_else(|| {
+        let want_stem = stem_of(&want).to_string();
+        pool.iter().find(|p| {
+            let f = file(p);
+            stem_of(&f) == want_stem.as_str()
+        })
+    })
+}
+
+/// When nothing matches by name: one picked file is used as is; in a pack, prefer albedo / diffuse / colour
+/// images and never use normal, roughness, metal, AO, height... maps as a colour. The map type is read from the
+/// end of the name (`Metal_Plate_Diffuse.png` is a diffuse map, `Metal_Plate_Normal.png` a normal map).
+fn default_pick(pool: &[PathBuf]) -> Option<&PathBuf> {
+    if pool.len() == 1 {
+        return pool.first();
+    }
+    const SKIP: &[&str] = &[
+        "normal", "normalgl", "normaldx", "nrm", "nor", "norm", "n", "rough", "roughness", "metal", "metallic", "metalness",
+        "spec", "specular", "gloss", "glossiness", "bump", "height", "disp", "displacement", "ao", "occlusion",
+        "ambientocclusion", "emissive", "emission", "emit", "opacity", "alpha", "mask", "orm", "arm", "rma",
+    ];
+    const LIKE: &[&str] = &["basecolor", "base_color", "base-color", "albedo", "diffuse", "color", "colour"];
+    let mut best: Option<(u32, &PathBuf)> = None;
+    for p in pool {
+        let Some(file) = p.file_name().and_then(|n| n.to_str()) else { continue };
+        let file = file.to_ascii_lowercase();
+        let stem = stem_of(&file);
+        let last = stem.rsplit(|c: char| c == '_' || c == '-' || c == '.' || c == ' ').next().unwrap_or(stem);
+        if SKIP.contains(&last) {
+            continue;
+        }
+        let score = if LIKE.iter().any(|k| stem.contains(k)) { 2 } else { 1 };
+        if best.map_or(true, |(b, _)| score > b) {
+            best = Some((score, p));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+enum TexMsg {
+    Slot(usize, ImageData),
+    Done { note: String },
+}
+
+enum TexOp {
+    Set(usize, ImageData),
+    Clear,
+}
+
+/// Worker thread: match the picked files / folder to the model's texture slots, decode, send them back.
+fn apply_pool(inputs: Vec<PathBuf>, slots: Vec<(String, bool)>, tx: Sender<TexMsg>, ctx: egui::Context) {
+    let pool = collect_pool(&inputs);
+    let mut cache: HashMap<PathBuf, ImageData> = HashMap::new();
+    let (mut applied, mut failed) = (0usize, 0usize);
+    for (i, (name, has_image)) in slots.iter().enumerate() {
+        let found = if name.is_empty() { None } else { resolve(name, &pool) };
+        // A material whose texture the model already carries keeps it unless a picked file has the same name.
+        let Some(path) = found.or_else(|| if *has_image { None } else { default_pick(&pool) }) else { continue };
+        let image = match cache.get(path) {
+            Some(img) => Some(img.clone()),
+            None => match decode_file(path) {
+                Ok(img) => {
+                    cache.insert(path.clone(), img.clone());
+                    Some(img)
+                }
+                Err(_) => None,
+            },
+        };
+        match image {
+            Some(img) => {
+                applied += 1;
+                if tx.send(TexMsg::Slot(i, img)).is_err() {
+                    return; // the view moved on
+                }
+                ctx.request_repaint();
+            }
+            None => failed += 1,
+        }
+    }
+    let note = if pool.is_empty() {
+        "No image files found in that selection.".to_string()
+    } else if applied == 0 {
+        format!("None of the {} picked image(s) fits this model's materials.", pool.len())
+    } else {
+        let mut n = format!("Applied {applied} of {} texture slot(s) from {} image(s).", slots.len(), pool.len());
+        if failed > 0 {
+            n.push_str(&format!(" {failed} couldn't be read."));
+        }
+        n
+    };
+    let _ = tx.send(TexMsg::Done { note });
+    ctx.request_repaint();
+}
+
+enum Pick {
+    Files(Vec<PathBuf>),
+    Folder(PathBuf),
 }
 
 // ------------------------------------------------------------------------------------------
@@ -713,15 +1147,18 @@ const VERTEX_SHADER: &str = r#"
 IN vec3 a_pos;
 IN vec3 a_nrm;
 IN vec3 a_col;
+IN vec2 a_uv;
 uniform mat4 u_mvp;
 uniform mat4 u_mv;
 VOUT vec3 v_n;
 VOUT vec3 v_p;
 VOUT vec3 v_col;
+VOUT vec2 v_uv;
 void main() {
     v_n = mat3(u_mv) * a_nrm;
     v_p = (u_mv * vec4(a_pos, 1.0)).xyz;
     v_col = a_col;
+    v_uv = a_uv;
     gl_Position = u_mvp * vec4(a_pos, 1.0);
     gl_PointSize = 3.0;
 }
@@ -738,12 +1175,21 @@ precision mediump float;
 FIN vec3 v_n;
 FIN vec3 v_p;
 FIN vec3 v_col;
+FIN vec2 v_uv;
 uniform float u_mode;   // 0 lit, 1 vertex colour as is (grid, points), 2 flat colour (wireframe)
 uniform float u_flat;   // 1: derive the normal from the screen-space slope of the surface
+uniform float u_use_tex; // 1: the colour comes from u_tex instead of the vertex colour
+uniform sampler2D u_tex;
 uniform vec3 u_color;
 void main() {
     if (u_mode > 1.5) { FRAG = vec4(u_color, 1.0); return; }
     if (u_mode > 0.5) { FRAG = vec4(v_col, 1.0); return; }
+    vec3 base = v_col;
+    if (u_use_tex > 0.5) {
+        vec4 t = TEXTURE2D(u_tex, v_uv);
+        if (t.a < 0.5) discard;   // cut-outs (leaves, fences)
+        base = t.rgb;
+    }
     vec3 n = (u_flat > 0.5) ? normalize(cross(dFdx(v_p), dFdy(v_p))) : normalize(v_n);
     if (n.z < 0.0) n = -n;   // two-sided: some files have flipped faces
     vec3 l1 = normalize(vec3(-0.35, 0.55, 0.75));
@@ -754,7 +1200,7 @@ void main() {
     float s = pow(max(dot(n, normalize(l1 + e)), 0.0), 40.0);
     float sky = 0.5 + 0.5 * n.y;
     vec3 light = vec3(0.20 + 0.12 * sky) + 0.60 * d1 + 0.18 * d2;
-    FRAG = vec4(v_col * light + vec3(0.12 * s), 1.0);
+    FRAG = vec4(base * light + vec3(0.12 * s), 1.0);
 }
 "#;
 
@@ -762,6 +1208,10 @@ fn bytes_of<T: Copy>(v: &[T]) -> &[u8] {
     // Plain-old-data (f32 / u32) only; GL wants native-endian bytes.
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
+
+/// Floats per vertex: position 3, normal 3, colour 3, texture coordinate 2.
+const FLOATS: usize = 11;
+const STRIDE: i32 = (FLOATS * 4) as i32;
 
 fn grid_vertices() -> Vec<f32> {
     let half = 8i32;
@@ -771,6 +1221,7 @@ fn grid_vertices() -> Vec<f32> {
             v.extend_from_slice(&p);
             v.extend_from_slice(&[0.0, 1.0, 0.0]);
             v.extend_from_slice(&c);
+            v.extend_from_slice(&[0.0, 0.0]);
         }
     };
     for i in -half..=half {
@@ -797,11 +1248,16 @@ struct GlRes {
     n_vert: i32,
     grid_first: i32,
     grid_count: i32,
+    parts: Vec<Part>,
+    /// One GL texture per texture slot (None: draw with plain colours).
+    tex: Vec<Option<glow::Texture>>,
     u_mvp: Option<glow::UniformLocation>,
     u_mv: Option<glow::UniformLocation>,
     u_mode: Option<glow::UniformLocation>,
     u_flat: Option<glow::UniformLocation>,
     u_color: Option<glow::UniformLocation>,
+    u_use_tex: Option<glow::UniformLocation>,
+    u_tex: Option<glow::UniformLocation>,
 }
 
 unsafe fn compile(gl: &glow::Context, kind: u32, source: &str) -> Result<glow::Shader, String> {
@@ -838,12 +1294,12 @@ impl GlRes {
         let (vs_pre, fs_pre) = if new_style {
             (
                 "#define IN in\n#define VOUT out\n",
-                "#define FIN in\nout vec4 f_color;\n#define FRAG f_color\n",
+                "#define FIN in\n#define TEXTURE2D texture\nout vec4 f_color;\n#define FRAG f_color\n",
             )
         } else {
             (
                 "#define IN attribute\n#define VOUT varying\n",
-                "#define FIN varying\n#define FRAG gl_FragColor\n",
+                "#define FIN varying\n#define TEXTURE2D texture2D\n#define FRAG gl_FragColor\n",
             )
         };
 
@@ -862,6 +1318,7 @@ impl GlRes {
             gl.bind_attrib_location(program, 0, "a_pos");
             gl.bind_attrib_location(program, 1, "a_nrm");
             gl.bind_attrib_location(program, 2, "a_col");
+            gl.bind_attrib_location(program, 3, "a_uv");
             gl.link_program(program);
             let linked = gl.get_program_link_status(program);
             gl.detach_shader(program, vs);
@@ -877,11 +1334,12 @@ impl GlRes {
             // One vertex buffer: the mesh first, the floor grid lines after it.
             let n = mesh.pos.len();
             let grid = grid_vertices();
-            let mut data: Vec<f32> = Vec::with_capacity(n * 9 + grid.len());
+            let mut data: Vec<f32> = Vec::with_capacity(n * FLOATS + grid.len());
             for i in 0..n {
                 data.extend_from_slice(&mesh.pos[i]);
                 data.extend_from_slice(&mesh.nrm[i]);
                 data.extend_from_slice(&mesh.col[i]);
+                data.extend_from_slice(&mesh.uv.get(i).copied().unwrap_or([0.0, 0.0]));
             }
             data.extend_from_slice(&grid);
 
@@ -890,9 +1348,9 @@ impl GlRes {
             let vbo = gl.create_buffer()?;
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes_of(&data), glow::STATIC_DRAW);
-            for (loc, offset) in [(0u32, 0i32), (1, 12), (2, 24)] {
+            for (loc, size, offset) in [(0u32, 3i32, 0i32), (1, 3, 12), (2, 3, 24), (3, 2, 36)] {
                 gl.enable_vertex_attrib_array(loc);
-                gl.vertex_attrib_pointer_f32(loc, 3, glow::FLOAT, false, 36, offset);
+                gl.vertex_attrib_pointer_f32(loc, size, glow::FLOAT, false, STRIDE, offset);
             }
             let ibo = gl.create_buffer()?;
             gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ibo));
@@ -901,6 +1359,11 @@ impl GlRes {
             }
             gl.bind_vertex_array(None);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
+
+            let mut parts = mesh.parts.clone();
+            if parts.is_empty() {
+                parts.push(Part { first: 0, count: mesh.idx.len() as u32, slot: None });
+            }
 
             Ok(Self {
                 gl: GlHandle(gl.clone()),
@@ -911,13 +1374,61 @@ impl GlRes {
                 n_idx: if points { 0 } else { mesh.idx.len() as i32 },
                 n_vert: n as i32,
                 grid_first: n as i32,
-                grid_count: (grid.len() / 9) as i32,
+                grid_count: (grid.len() / FLOATS) as i32,
+                parts,
+                tex: Vec::new(),
                 u_mvp: gl.get_uniform_location(program, "u_mvp"),
                 u_mv: gl.get_uniform_location(program, "u_mv"),
                 u_mode: gl.get_uniform_location(program, "u_mode"),
                 u_flat: gl.get_uniform_location(program, "u_flat"),
                 u_color: gl.get_uniform_location(program, "u_color"),
+                u_use_tex: gl.get_uniform_location(program, "u_use_tex"),
+                u_tex: gl.get_uniform_location(program, "u_tex"),
             })
+        }
+    }
+
+    unsafe fn apply(&mut self, op: TexOp) {
+        let gl = &*self.gl.0;
+        match op {
+            TexOp::Clear => {
+                for t in self.tex.drain(..).flatten() {
+                    gl.delete_texture(t);
+                }
+            }
+            TexOp::Set(slot, img) => {
+                if slot >= MAX_SLOTS {
+                    return;
+                }
+                if self.tex.len() <= slot {
+                    self.tex.resize(slot + 1, None);
+                }
+                if let Some(old) = self.tex[slot].take() {
+                    gl.delete_texture(old);
+                }
+                let Ok(t) = gl.create_texture() else { return };
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA8 as i32,
+                    img.w as i32,
+                    img.h as i32,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    Some(img.rgba.as_slice()),
+                );
+                gl.generate_mipmap(glow::TEXTURE_2D);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR_MIPMAP_LINEAR as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::REPEAT as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::REPEAT as i32);
+                gl.bind_texture(glow::TEXTURE_2D, None);
+                self.tex[slot] = Some(t);
+            }
         }
     }
 
@@ -938,6 +1449,9 @@ impl GlRes {
         gl.use_program(Some(self.program));
         gl.bind_vertex_array(Some(self.vao));
         gl.uniform_1_f32(self.u_flat.as_ref(), if d.flat { 1.0 } else { 0.0 });
+        gl.uniform_1_f32(self.u_use_tex.as_ref(), 0.0);
+        gl.uniform_1_i32(self.u_tex.as_ref(), 0);
+        gl.active_texture(glow::TEXTURE0);
 
         if d.grid {
             gl.uniform_matrix_4_f32_slice(self.u_mvp.as_ref(), false, &d.grid_mvp);
@@ -959,7 +1473,20 @@ impl GlRes {
                     gl.enable(glow::POLYGON_OFFSET_FILL);
                     gl.polygon_offset(1.0, 1.0);
                 }
-                gl.draw_elements(glow::TRIANGLES, self.n_idx, glow::UNSIGNED_INT, 0);
+                // One draw call per run of triangles that share a texture.
+                for part in &self.parts {
+                    let tex = part.slot.and_then(|s| self.tex.get(s).copied().flatten());
+                    match tex {
+                        Some(t) => {
+                            gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                            gl.uniform_1_f32(self.u_use_tex.as_ref(), 1.0);
+                        }
+                        None => gl.uniform_1_f32(self.u_use_tex.as_ref(), 0.0),
+                    }
+                    gl.draw_elements(glow::TRIANGLES, part.count as i32, glow::UNSIGNED_INT, (part.first * 4) as i32);
+                }
+                gl.uniform_1_f32(self.u_use_tex.as_ref(), 0.0);
+                gl.bind_texture(glow::TEXTURE_2D, None);
                 gl.disable(glow::POLYGON_OFFSET_FILL);
             }
             if wire != 0 {
@@ -981,6 +1508,9 @@ impl Drop for GlRes {
     fn drop(&mut self) {
         unsafe {
             let gl = &*self.gl.0;
+            for t in self.tex.drain(..).flatten() {
+                gl.delete_texture(t);
+            }
             gl.delete_program(self.program);
             gl.delete_vertex_array(self.vao);
             gl.delete_buffer(self.vbo);
@@ -995,6 +1525,8 @@ struct Gpu {
     points: bool,
     res: Option<GlRes>,
     error: Option<String>,
+    /// Texture uploads waiting for the next paint (the GL context only exists inside the callback).
+    pending: Vec<TexOp>,
 }
 
 impl Gpu {
@@ -1008,7 +1540,10 @@ impl Gpu {
                 None => self.error = Some("The model data is gone".into()),
             }
         }
-        if let Some(res) = &self.res {
+        if let Some(res) = &mut self.res {
+            for op in self.pending.drain(..) {
+                unsafe { res.apply(op) };
+            }
             unsafe { res.draw(d) };
         }
     }
@@ -1048,6 +1583,13 @@ pub struct ModelView {
     fit_pending: bool,
     /// Arrow keys rotate the model. Off when the model sits next to a file list that uses them.
     arrow_keys: bool,
+    /// Texture slots (name the model uses, has an image yet).
+    slots: Vec<(String, bool)>,
+    textured: usize,
+    tex_rx: Option<Receiver<TexMsg>>,
+    /// A native file dialog is open on its own thread.
+    dialog_rx: Option<Receiver<Option<Pick>>>,
+    tex_note: String,
 }
 
 fn count(n: usize) -> String {
@@ -1081,8 +1623,19 @@ impl ModelView {
         }
         let tris = if d.points { 0 } else { d.mesh.idx.len() / 3 };
         let verts = d.mesh.pos.len();
+        // Textures that came with the model are uploaded on the first paint.
+        let mut pending = Vec::new();
+        let mut slots = Vec::new();
+        for (i, slot) in d.slots.into_iter().enumerate() {
+            let has_image = slot.image.is_some();
+            if let Some(img) = slot.image {
+                pending.push(TexOp::Set(i, img));
+            }
+            slots.push((slot.name, has_image));
+        }
+        let textured = slots.iter().filter(|s| s.1).count();
         Self {
-            gpu: Arc::new(Mutex::new(Gpu { mesh: Some(d.mesh), points: d.points, res: None, error: None })),
+            gpu: Arc::new(Mutex::new(Gpu { mesh: Some(d.mesh), points: d.points, res: None, error: None, pending })),
             format: d.format,
             tris,
             verts,
@@ -1101,6 +1654,164 @@ impl ModelView {
             help: false,
             fit_pending: true,
             arrow_keys: true,
+            slots,
+            textured,
+            tex_rx: None,
+            dialog_rx: None,
+            tex_note: String::new(),
+        }
+    }
+
+    /// True while a file dialog is open: the preview window must not treat the lost focus as "click away".
+    pub fn modal_busy(&self) -> bool {
+        self.dialog_rx.is_some()
+    }
+
+    fn push_op(&self, op: TexOp) {
+        self.gpu.lock().unwrap_or_else(|e| e.into_inner()).pending.push(op);
+    }
+
+    fn start_dialog(&mut self, ctx: &egui::Context, folder: bool) {
+        if self.dialog_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let pick = if folder {
+                rfd::FileDialog::new().set_title("Choose a texture folder").pick_folder().map(Pick::Folder)
+            } else {
+                rfd::FileDialog::new()
+                    .set_title("Choose texture images")
+                    .add_filter("Images", TEX_EXTS)
+                    .pick_files()
+                    .map(Pick::Files)
+            };
+            let _ = tx.send(pick);
+            ctx.request_repaint();
+        });
+        self.dialog_rx = Some(rx);
+    }
+
+    fn start_apply(&mut self, ctx: &egui::Context, inputs: Vec<PathBuf>) {
+        if self.slots.is_empty() {
+            self.tex_note = "This model has no texture coordinates (UVs), so textures can't be mapped onto it.".into();
+            return;
+        }
+        let slots = self.slots.clone();
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        thread::spawn(move || apply_pool(inputs, slots, tx, ctx));
+        self.tex_rx = Some(rx);
+        self.tex_note = "Applying textures…".into();
+    }
+
+    fn clear_textures(&mut self) {
+        self.push_op(TexOp::Clear);
+        for s in self.slots.iter_mut() {
+            s.1 = false;
+        }
+        self.textured = 0;
+        self.tex_rx = None;
+        self.tex_note = "Textures removed.".into();
+    }
+
+    /// Collect results from the file dialog and the texture worker (called every frame, cheap).
+    fn poll_textures(&mut self, ctx: &egui::Context) {
+        let dialog = self.dialog_rx.as_ref().map(|rx| rx.try_recv());
+        match dialog {
+            Some(Ok(pick)) => {
+                self.dialog_rx = None;
+                match pick {
+                    Some(Pick::Files(files)) => self.start_apply(ctx, files),
+                    Some(Pick::Folder(dir)) => self.start_apply(ctx, vec![dir]),
+                    None => {}
+                }
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.dialog_rx = None;
+                self.tex_note = "Couldn't open a file dialog here. Drop image files or a folder onto the window instead.".into();
+            }
+            _ => {}
+        }
+
+        let mut msgs = Vec::new();
+        let mut gone = false;
+        if let Some(rx) = &self.tex_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(m) => msgs.push(m),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        gone = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let mut finished = gone;
+        for m in msgs {
+            match m {
+                TexMsg::Slot(i, img) => {
+                    if let Some(slot) = self.slots.get_mut(i) {
+                        if !slot.1 {
+                            slot.1 = true;
+                            self.textured += 1;
+                        }
+                    }
+                    self.push_op(TexOp::Set(i, img));
+                }
+                TexMsg::Done { note } => {
+                    self.tex_note = note;
+                    finished = true;
+                }
+            }
+        }
+        if finished {
+            if gone && self.tex_note.starts_with("Applying") {
+                self.tex_note = "Reading the textures failed.".into();
+            }
+            self.tex_rx = None;
+        }
+    }
+
+    /// Right end of the status bar: the optional "Textures" menu.
+    pub fn footer_ui(&mut self, ui: &mut egui::Ui) {
+        if self.error().is_some() {
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        self.poll_textures(&ctx);
+        let busy = self.tex_rx.is_some() || self.dialog_rx.is_some();
+        let label = if self.textured > 0 { format!("Textures · {}", self.textured) } else { "Textures".to_string() };
+        let can_map = !self.slots.is_empty();
+        let reply = ui.menu_button(RichText::new(label).size(13.5), |ui| {
+            ui.set_min_width(260.0);
+            if ui.add_enabled(can_map && !busy, egui::Button::new("Choose texture files…")).clicked() {
+                self.start_dialog(&ctx, false);
+                ui.close_menu();
+            }
+            if ui.add_enabled(can_map && !busy, egui::Button::new("Choose texture folder…")).clicked() {
+                self.start_dialog(&ctx, true);
+                ui.close_menu();
+            }
+            if self.textured > 0 && ui.add_enabled(!busy, egui::Button::new("Remove textures")).clicked() {
+                self.clear_textures();
+                ui.close_menu();
+            }
+            ui.separator();
+            let hint = if !can_map {
+                "This model has no texture coordinates (UVs), so textures can't be mapped onto it.".to_string()
+            } else if !self.tex_note.is_empty() {
+                self.tex_note.clone()
+            } else {
+                "Optional. You can also drop image files or a folder onto the preview.".to_string()
+            };
+            ui.add(egui::Label::new(RichText::new(hint).small().weak()).wrap_mode(egui::TextWrapMode::Wrap));
+        });
+        reply.response.on_hover_text("Optional: use your own texture images or a texture-pack folder");
+        if busy {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 
@@ -1121,14 +1832,18 @@ impl ModelView {
             size_text(self.max[2] - self.min[2])
         );
         let mode = ["Shaded", "Wire overlay", "Wireframe"][self.wire as usize % 3];
-        vec![
+        let mut chips = vec![
             (icons::CUBE, format!("{} · {geometry}", self.format)),
             (icons::ARROWS_OUT, dims),
             (
                 icons::EYE,
                 format!("{}-up · {} · {mode}", if self.zup { "Z" } else { "Y" }, if self.ortho { "Ortho" } else { "Perspective" }),
             ),
-        ]
+        ];
+        if self.textured > 0 {
+            chips.push((icons::IMAGE, format!("{} texture{}", self.textured, if self.textured == 1 { "" } else { "s" })));
+        }
+        chips
     }
 
     fn error(&self) -> Option<String> {
@@ -1382,6 +2097,11 @@ impl ModelView {
             self.fit_pending = false;
         }
         self.input(&ctx, &response, rect);
+        self.poll_textures(&ctx);
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        if !dropped.is_empty() {
+            self.start_apply(&ctx, dropped);
+        }
         if !self.ready() {
             ctx.request_repaint(); // the GL objects are created during the first paint
         }
@@ -1397,6 +2117,17 @@ impl ModelView {
                 gpu.paint(p.gl(), &draw);
             })),
         });
+
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            painter.rect_filled(rect, 6.0, Color32::from_black_alpha(150));
+            painter.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                "Drop images or a folder to use as textures",
+                FontId::proportional(18.0),
+                Color32::WHITE,
+            );
+        }
 
         // Overlay: a one-line hint, or the full shortcut list (H).
         if self.help {
@@ -1459,13 +2190,38 @@ mod tests {
     #[test]
     fn mesh_add_rejects_bad_indices() {
         let mut m = Mesh::default();
-        assert!(m.add(&[[0.0; 3]; 3], None, None, DEFAULT_COLOR, &[0, 1, 7]).is_err());
+        assert!(m.add(&[[0.0; 3]; 3], None, None, DEFAULT_COLOR, None, None, &[0, 1, 7]).is_err());
     }
 
     #[test]
     fn matrix_identity_and_translate() {
         let m = mul(&identity(), &translate([1.0, 2.0, 3.0]));
         assert_eq!(transform_point(&m, [1.0, 1.0, 1.0]), [2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn texture_names_are_matched_loosely() {
+        let pool = vec![PathBuf::from("/t/Wood_Diffuse.PNG"), PathBuf::from("/t/Wood_Normal.png"), PathBuf::from("/t/brick.jpg")];
+        assert_eq!(resolve("textures\\brick.jpg", &pool), Some(&pool[2]));
+        assert_eq!(resolve("wood_diffuse.tga", &pool), Some(&pool[0])); // other extension, same name
+        assert_eq!(resolve("missing.png", &pool), None);
+    }
+
+    #[test]
+    fn default_pick_prefers_colour_maps() {
+        let pool = vec![PathBuf::from("/t/Metal_Plate_Normal.png"), PathBuf::from("/t/Metal_Plate_Diffuse.png")];
+        assert_eq!(default_pick(&pool), Some(&pool[1]));
+        let only_maps = vec![PathBuf::from("/t/a_normal.png"), PathBuf::from("/t/a_roughness.png")];
+        assert_eq!(default_pick(&only_maps), None);
+        let single = vec![PathBuf::from("/t/whatever_normal.png")];
+        assert_eq!(default_pick(&single), Some(&single[0])); // an explicit single pick is always used
+    }
+
+    #[test]
+    fn base64_and_percent_decoding() {
+        assert_eq!(base64_decode("aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(percent_decode("my%20tex.png"), "my tex.png");
+        assert_eq!(clean_tex_name("-s 1 1 1 wood.png"), "wood.png");
     }
 
     #[test]
