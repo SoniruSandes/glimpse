@@ -1,0 +1,28 @@
+name: check
+
+# A quick compile check (no linking, no packaging) on Windows for every commit, on every branch.
+# Tag pushes don't match a branch filter, so releases are left to build.yml.
+on:
+  push:
+    branches: ["**"]
+
+# A newer push to the same branch makes the older, still-running check pointless.
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-check:
+    name: cargo check (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: check-windows
+
+      - name: cargo check
+        run: cargo check

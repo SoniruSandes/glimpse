@@ -1,11 +1,11 @@
 name: build
 
+# Builds and publishes a release only when a version tag is pushed, e.g.:
+#   git tag v0.8.0 && git push origin v0.8.0
+# (Ordinary commits are checked by check.yml instead.)
 on:
   push:
-    branches: [main]
     tags: ["v*"]
-  pull_request:
-  workflow_dispatch:
 
 jobs:
   build:
