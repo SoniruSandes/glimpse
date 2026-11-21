@@ -4,11 +4,15 @@
 //! The window is always undecorated. Pinning only changes behaviour (not always-on-top, stays open,
 //! resizable); it never switches native window decorations at runtime.
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use eframe::egui::{self, vec2, Align2, Color32, CursorIcon, FontId, Margin, RichText, Sense, Stroke};
 
 use crate::{
+    appinfo,
     content::{self, Pane},
     icons,
     media::WindowHint,
@@ -23,11 +27,30 @@ pub struct Options {
     pub via_shortcut: bool,
 }
 
-pub fn run(options: Options) {
+pub fn run(mut options: Options) {
     window::set_sticky(options.always_pin);
+
+    // A .lnk opened directly previews what it points to.
+    let is_lnk = options.path.extension().map(|e| e.eq_ignore_ascii_case("lnk")).unwrap_or(false);
+    if is_lnk {
+        if let Some(target) = crate::shortcut::target(&options.path).filter(|t| t.exists()) {
+            options.path = target;
+            options.via_shortcut = true;
+        }
+    }
+    appinfo::set_via_shortcut(options.via_shortcut);
+
+    // A program gets the small info card (650 x 300); everything else the big window.
+    let is_app = options
+        .path
+        .extension()
+        .map(|e| appinfo::APP_EXTS.contains(&e.to_string_lossy().to_ascii_lowercase().as_str()))
+        .unwrap_or(false);
+    let (size, min_size) = if is_app { (appinfo::WINDOW_SIZE, [420.0, 240.0]) } else { ([1100.0, 720.0], [520.0, 360.0]) };
+
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1100.0, 720.0])
-        .with_min_inner_size([520.0, 360.0])
+        .with_inner_size(size)
+        .with_min_inner_size(min_size)
         .with_decorations(false)
         .with_title("Quick Look");
     // icons/window.png: the icon of the running window (taskbar button, Alt+Tab).
@@ -64,6 +87,9 @@ struct PreviewApp {
     pinned: bool,
     had_focus: bool,
     asked_focus: bool,
+    /// A file dialog (3D texture picker) was open: don't close on lost focus while it is, or just after.
+    was_modal: bool,
+    modal_until: Option<Instant>,
     applied_hint: Option<(u8, i32, i32)>,
     #[cfg(windows)]
     corners_done: bool,
@@ -110,6 +136,8 @@ impl PreviewApp {
             pinned: options.always_pin,
             had_focus: false,
             asked_focus: false,
+            was_modal: false,
+            modal_until: None,
             applied_hint: None,
             #[cfg(windows)]
             corners_done: false,
@@ -219,13 +247,19 @@ impl PreviewApp {
             });
     }
 
-    fn status_bar(&self, ctx: &egui::Context) {
+    fn status_bar(&mut self, ctx: &egui::Context) {
         let chips = self.pane.content.chips();
         egui::TopBottomPanel::bottom("footer")
             .exact_height(38.0)
             .frame(egui::Frame::none().fill(theme::BAR_FILL).inner_margin(Margin::symmetric(16.0, 6.0)))
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    // Right end first: actions of the current content (e.g. the 3D "Textures" menu).
+                    // Everything else fills the space that is left, on the left.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.pane.content.footer_ui(ui);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     ui.label(RichText::new(&self.info.type_label).size(13.5).strong().color(Color32::from_gray(230)));
                     for chip in &chips {
@@ -248,6 +282,8 @@ impl PreviewApp {
                         )
                         .on_hover_text(real);
                     }
+                    });
+                    });
                 });
             });
     }
@@ -292,7 +328,28 @@ impl eframe::App for PreviewApp {
         if focus_state == Some(true) {
             self.had_focus = true;
         }
-        let lost_focus = !self.pinned && self.had_focus && focus_state == Some(false);
+        // A native file dialog (texture picker) takes the focus: that is not "clicking away". While it is open the
+        // window also steps down from always-on-top so the dialog can't hide behind it, and afterwards it takes
+        // the focus back.
+        let modal = self.pane.content.modal_busy();
+        if modal {
+            self.modal_until = Some(Instant::now() + Duration::from_millis(1500));
+        }
+        if modal != self.was_modal {
+            self.was_modal = modal;
+            if !self.pinned {
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if modal {
+                    egui::WindowLevel::Normal
+                } else {
+                    egui::WindowLevel::AlwaysOnTop
+                }));
+            }
+            if !modal {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
+        let modal_grace = modal || self.modal_until.map_or(false, |t| Instant::now() < t);
+        let lost_focus = !self.pinned && !modal_grace && self.had_focus && focus_state == Some(false);
         // Esc / Space close an unpinned preview, and also an "always pin" one (like Quick Look).
         // Not while typing: Esc first leaves a text box (password, find) and only then closes the window.
         let close_key = (!self.pinned || self.always_pin)
@@ -317,7 +374,9 @@ impl eframe::App for PreviewApp {
         let maximized = ctx.input(|i| i.viewport().maximized).unwrap_or(false);
         self.apply_window_hint(ctx, maximized);
         self.title_bar(ctx, maximized);
-        self.status_bar(ctx);
+        if !self.pane.content.hides_status_bar() {
+            self.status_bar(ctx);
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(theme::PANEL_FILL).inner_margin(Margin::same(10.0)))
             .show(ctx, |ui| self.pane.ui(ui));

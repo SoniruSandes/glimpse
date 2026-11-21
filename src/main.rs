@@ -4,7 +4,10 @@
 //   quicklook --preview <path>      -> same (used internally; flags: --always-pin, --via-shortcut)
 #![windows_subsystem = "windows"]
 
+mod aep;
+mod appinfo;
 mod archive;
+mod cards;
 mod content;
 mod folder;
 mod highlight;
@@ -19,6 +22,7 @@ mod passwords;
 mod pdf;
 mod preview;
 mod settings;
+mod shortcut;
 mod theme;
 mod tray;
 mod window;

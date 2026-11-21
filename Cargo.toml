@@ -1,6 +1,6 @@
 [package]
 name = "quicklook"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Quick File preview (Peek-View) for Windows and Linux"
 
@@ -18,7 +18,7 @@ rar = ["dep:unrar"]
 tray-icon = "0.19"
 eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 egui_extras = { version = "0.29", default-features = false }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tga"] }
 calamine = "0.31"
 csv = "1"
 zip = { version = "2", default-features = false, features = ["deflate", "deflate64"] }
@@ -28,10 +28,13 @@ libloading = "0.8"
 psd = "0.3"
 resvg = "0.45"
 open = "5"
+pelite = "0.10"
 pulldown-cmark = { version = "0.13", default-features = false }
-# 3D models: OBJ via tobj, glTF/GLB via gltf (no textures decoded, no C code). STL and PLY have small built-in parsers.
+# 3D models: OBJ via tobj, glTF/GLB via gltf (base-colour textures only, no C code). STL and PLY have small built-in parsers.
 tobj = "4"
-gltf = { version = "1.4", default-features = false, features = ["import", "utils"] }
+gltf = { version = "1.4", default-features = false, features = ["import", "utils", "names"] }
+# Optional texture picker for 3D models (native file / folder dialog). Linux uses the desktop portal (no GTK needed).
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 
 # EXE icon + version info (build.rs, app.rc). Only needed when the build machine runs Windows.
 [target.'cfg(windows)'.build-dependencies]

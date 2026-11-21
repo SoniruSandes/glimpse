@@ -1,4 +1,4 @@
-# Glimpse (Quick-look) Pre-Release v0.7
+# Glimpse (Quick-look) Pre-Release v0.8
 
 Spacebar file preview, like macOS Quick Look, for **Windows** and **Linux**. A tray icon, no dashboard.
 
@@ -12,6 +12,27 @@ Spacebar file preview, like macOS Quick Look, for **Windows** and **Linux**. A t
 Not supported: Windows 7 / 8 (current Rust, WebView2 and the Windows PDF renderer all need Windows 10+),
 macOS. 32-bit Windows would build with the `i686-pc-windows-msvc` target but isn't in CI.
 
+## New in 0.8
+
+- **Programs (`.exe`) and shortcuts (`.lnk`):** a small 650 x 300 info card with the program's icon, name, CPU type
+  (x64 / x86 / ARM64), real location, file and product version, company and size. A `.lnk` shows its **target's**
+  card (a link marker sits next to the location). Read in pure Rust, so nothing is run or loaded, and it also
+  works on Linux.
+- **After Effects projects (`.aep`):** AE version that saved it, every composition (size, frame rate, duration)
+  and named footage. An .aep stores no preview picture, so this is a summary of what's inside. Only the small
+  parts of the file are read, so multi-GB projects open instantly. (`.aepx` opens as XML source.)
+- **Markdown:** table columns sized to their content, with `:---:` alignment; collapsible `<details>` /
+  `<summary>`; footnotes (click the marker to jump); links for bare URLs; `:emoji:` shortcodes; local `.svg`
+  images; the Source view is syntax-coloured.
+- **Code colours:** new highlighter with distinct colours for keywords, control flow, types, built-in types,
+  functions, macros, attributes / decorators, constants, numbers, strings and their escapes, and comments (doc
+  comments differ). Used in Markdown code blocks **and** now in the plain file view for Rust, JS / TS, Python,
+  C / C++, C#, Java, Kotlin, Go, Swift, PHP, Ruby, Lua, Shell, PowerShell, Batch, SQL, JSON, YAML, TOML / INI,
+  CSS / SCSS, HTML / XML / SVG / Vue (with embedded `<script>` / `<style>`), Diff, Dockerfile, Makefile and
+  Markdown itself.
+- **CI:** `build.yml` now runs **only when a `v*` tag is pushed** (and then publishes the release); the new
+  `check.yml` runs `cargo check` on Windows for every pushed commit.
+
 ## New in 0.7
 
 - **Player:** the played part of the seek and volume bars is coloured; video controls appear over the picture
@@ -22,14 +43,6 @@ macOS. 32-bit Windows would build with the `i686-pc-windows-msvc` target but isn
 - **Markdown:** syntax-highlighted code with a copy button, an outline panel with section tracking, Find (Ctrl+F),
   `#anchor` links, front matter shown as a card, text size (Ctrl/Alt +/-, Ctrl+wheel).
 - **Icons:** `icons/tray.ico`, `icons/app.ico`, `icons/window.png` (see `icons/README.txt`).
-
-## Build
-
-Push to GitHub: `.github/workflows/build.yml` builds all four targets and uploads artifacts
-(tag `v0.6.0` to also create a release). Locally: `cargo build --release`.
-
-Linux build packages: `build-essential pkg-config libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxkbcommon-dev libwayland-dev libx11-dev`.
-If the RAR library gives trouble on a target: `cargo build --release --no-default-features` (everything else still works).
 
 ## Run-time pieces that aren't in the executable
 

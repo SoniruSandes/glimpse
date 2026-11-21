@@ -129,6 +129,7 @@ pub struct HtmlView {
     path: PathBuf,
     lines: Vec<String>,
     truncated: bool,
+    hl: crate::content::Colors,
     web_mode: bool,
     web: Option<WebPane>,
     error: Option<String>,
@@ -138,8 +139,8 @@ pub struct HtmlView {
 }
 
 impl HtmlView {
-    pub fn new(path: PathBuf, lines: Vec<String>, truncated: bool) -> Self {
-        Self { path, lines, truncated, web_mode: false, web: None, error: None, starting_frames: 0 }
+    pub fn new(path: PathBuf, lines: Vec<String>, truncated: bool, hl: crate::content::Colors) -> Self {
+        Self { path, lines, truncated, hl, web_mode: false, web: None, error: None, starting_frames: 0 }
     }
 
     pub fn chips(&self) -> Vec<Chip> {
@@ -179,7 +180,7 @@ impl HtmlView {
             if let Some(web) = self.web.as_mut() {
                 web.hide();
             }
-            text_ui(ui, &self.lines);
+            text_ui(ui, &self.lines, self.hl.as_deref());
             return;
         }
 

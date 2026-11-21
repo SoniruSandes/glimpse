@@ -180,6 +180,9 @@ pub fn file_icon(name: &str) -> &'static str {
             icons::FILE_VIDEO
         }
         "mp3" | "wav" | "flac" | "ogg" | "oga" | "opus" | "m4a" | "aac" | "wma" | "aiff" | "ape" | "mka" => icons::FILE_AUDIO,
+        "exe" | "msi" | "dll" => icons::FILE_CODE,
+        "lnk" => icons::LINK_SIMPLE,
+        "aep" | "aepx" => icons::FILM_STRIP,
         "obj" | "stl" | "ply" | "gltf" | "glb" => icons::CUBE,
         "pdf" => icons::FILE_PDF,
         "zip" | "7z" | "rar" | "jar" | "apk" | "cbz" | "cbr" | "war" => icons::FILE_ZIP,

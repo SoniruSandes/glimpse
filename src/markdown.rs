@@ -52,6 +52,8 @@ pub struct Span {
     pub link: Option<String>,
     /// A line break (the text is empty).
     pub br: bool,
+    /// Small raised text (footnote references).
+    pub sup: bool,
 }
 
 impl Span {
@@ -117,7 +119,11 @@ pub enum MdBlock {
     Meta(String),
     Quote { alert: Option<Alert>, blocks: Vec<MdBlock> },
     List { start: Option<u64>, items: Vec<Item> },
-    Table { head: Vec<Vec<Span>>, rows: Vec<Vec<Vec<Span>>> },
+    /// `align` per column: 0 left, 1 centre, 2 right.
+    Table { head: Vec<Vec<Span>>, rows: Vec<Vec<Vec<Span>>>, align: Vec<u8> },
+    /// `<details><summary>..</summary> .. </details>`
+    Details { summary: String, open: bool, blocks: Vec<MdBlock> },
+    Footnote { n: usize, blocks: Vec<MdBlock> },
     Rule,
     Image { key: String, alt: String, link: Option<String> },
 }
@@ -147,12 +153,17 @@ struct Builder<'a> {
     images: HashMap<String, egui::ColorImage>,
     in_comment: bool,
     depth: u32,
+    footnotes: Vec<(String, Vec<MdBlock>)>,
+    foot_order: Vec<String>,
+    details_open: u32,
+    details_closed: bool,
 }
 
 pub fn parse(text: &str, path: &Path) -> MdDoc {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
     let events: Vec<Event> = Parser::new_ext(text, options).collect();
     let mut builder = Builder {
@@ -167,8 +178,13 @@ pub fn parse(text: &str, path: &Path) -> MdDoc {
         images: HashMap::new(),
         in_comment: false,
         depth: 0,
+        footnotes: Vec::new(),
+        foot_order: Vec::new(),
+        details_open: 0,
+        details_closed: false,
     };
-    let blocks = builder.blocks();
+    let mut blocks = builder.blocks();
+    builder.append_footnotes(&mut blocks);
     MdDoc { blocks, images: builder.images }
 }
 
@@ -203,8 +219,27 @@ impl<'a> Builder<'a> {
             match ev {
                 Event::Start(Tag::Paragraph) => {}
                 Event::End(TagEnd::Paragraph) => self.flush(&mut out),
-                Event::Start(Tag::HtmlBlock) => self.flush(&mut out),
+                Event::Start(Tag::HtmlBlock) => {
+                    self.flush(&mut out);
+                    let mut raw = String::new();
+                    while let Some(e) = self.ev.next() {
+                        match e {
+                            Event::Html(h) => raw.push_str(&h),
+                            Event::End(TagEnd::HtmlBlock) => break,
+                            _ => {}
+                        }
+                    }
+                    self.html_block(&raw, &mut out);
+                    if self.details_closed {
+                        break;
+                    }
+                }
                 Event::End(TagEnd::HtmlBlock) => self.flush(&mut out),
+                Event::Start(Tag::FootnoteDefinition(label)) => {
+                    self.flush(&mut out);
+                    let inner = self.blocks();
+                    self.footnotes.push((label.to_string(), inner));
+                }
                 Event::Start(Tag::Heading { level, .. }) => {
                     self.flush(&mut out);
                     let spans = self.inline_until_end();
@@ -252,9 +287,17 @@ impl<'a> Builder<'a> {
                     let list = self.list(start);
                     out.push(list);
                 }
-                Event::Start(Tag::Table(_)) => {
+                Event::Start(Tag::Table(aligns)) => {
                     self.flush(&mut out);
-                    let table = self.table();
+                    let align = aligns
+                        .iter()
+                        .map(|a| match a {
+                            pulldown_cmark::Alignment::Center => 1,
+                            pulldown_cmark::Alignment::Right => 2,
+                            _ => 0,
+                        })
+                        .collect();
+                    let table = self.table(align);
                     out.push(table);
                 }
                 Event::Rule => {
@@ -357,7 +400,7 @@ impl<'a> Builder<'a> {
         MdBlock::List { start, items }
     }
 
-    fn table(&mut self) -> MdBlock {
+    fn table(&mut self, align: Vec<u8>) -> MdBlock {
         let mut head: Vec<Vec<Span>> = Vec::new();
         let mut rows: Vec<Vec<Vec<Span>>> = Vec::new();
         let mut row: Vec<Vec<Span>> = Vec::new();
@@ -374,7 +417,80 @@ impl<'a> Builder<'a> {
                 _ => {}
             }
         }
-        MdBlock::Table { head, rows }
+        MdBlock::Table { head, rows, align }
+    }
+
+    /// Footnote definitions, numbered in the order they are first referenced, after a rule at the end.
+    fn append_footnotes(&mut self, out: &mut Vec<MdBlock>) {
+        if self.footnotes.is_empty() {
+            return;
+        }
+        let mut notes = std::mem::take(&mut self.footnotes);
+        let order = self.foot_order.clone();
+        notes.sort_by_key(|(label, _)| order.iter().position(|l| l == label).unwrap_or(usize::MAX));
+        out.push(MdBlock::Rule);
+        for (label, blocks) in notes {
+            let n = order.iter().position(|l| *l == label).map_or(order.len() + 1, |p| p + 1);
+            out.push(MdBlock::Footnote { n, blocks });
+        }
+    }
+
+    /// An HTML block. `<details>` / `<summary>` become a collapsible section; anything else is kept as text.
+    fn html_block(&mut self, raw: &str, out: &mut Vec<MdBlock>) {
+        let lower = raw.to_ascii_lowercase();
+        // The end of a <details> section whose content was parsed as Markdown.
+        if self.details_open > 0 {
+            if let Some(close) = lower.find("</details") {
+                self.html(&raw[..close]);
+                self.flush(out);
+                let after = lower[close..].find('>').map(|e| close + e + 1).unwrap_or(raw.len());
+                self.html(&raw[after..]);
+                self.details_closed = true;
+                return;
+            }
+        }
+        let Some(open_at) = lower.find("<details") else {
+            self.html(raw);
+            self.flush(out);
+            return;
+        };
+        self.html(&raw[..open_at]);
+        self.flush(out);
+        let tag_end = lower[open_at..].find('>').map(|e| open_at + e + 1).unwrap_or(raw.len());
+        let open = lower[open_at..tag_end].contains("open");
+        let (after, after_lower) = (&raw[tag_end..], &lower[tag_end..]);
+
+        let mut summary = String::from("Details");
+        let mut body = after;
+        if let Some(s) = after_lower.find("<summary") {
+            if let Some(gt) = after_lower[s..].find('>') {
+                let start = s + gt + 1;
+                let end = after_lower[start..].find("</summary").map(|e| start + e).unwrap_or(after.len());
+                summary = strip_tags(&after[start..end]).trim().to_string();
+                let skip = after_lower[end..].find('>').map(|e| end + e + 1).unwrap_or(after.len());
+                body = &after[skip.min(after.len())..];
+            }
+        }
+
+        let mut inner = Vec::new();
+        let body_lower = body.to_ascii_lowercase();
+        if let Some(close) = body_lower.find("</details") {
+            // Everything is in this one block.
+            self.html(&body[..close]);
+            self.flush(&mut inner);
+            let end = body_lower[close..].find('>').map(|e| close + e + 1).unwrap_or(body.len());
+            out.push(MdBlock::Details { summary, open, blocks: inner });
+            self.html(&body[end..]);
+            return;
+        }
+        self.html(body);
+        self.flush(&mut inner);
+        self.details_open += 1;
+        let more = self.blocks();
+        self.details_open -= 1;
+        self.details_closed = false;
+        inner.extend(more);
+        out.push(MdBlock::Details { summary, open, blocks: inner });
     }
 
     // ---- inline ----
@@ -393,9 +509,32 @@ impl<'a> Builder<'a> {
         if text.is_empty() {
             return;
         }
+        let text = emojify(text);
+        // Bare web addresses become links (outside of explicit links).
+        if self.links.is_empty() && (text.contains("http://") || text.contains("https://")) {
+            for (piece, url) in split_urls(&text) {
+                match url {
+                    Some(url) => {
+                        let mut span = self.style();
+                        span.text = piece;
+                        span.link = Some(url);
+                        self.spans.push(span);
+                    }
+                    None => self.push_plain(&piece),
+                }
+            }
+            return;
+        }
+        self.push_plain(&text);
+    }
+
+    fn push_plain(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
         let style = self.style();
         if let Some(last) = self.spans.last_mut() {
-            if !last.br && !last.code && !last.dim && last.same_style(&style) {
+            if !last.br && !last.code && !last.dim && !last.sup && last.same_style(&style) {
                 last.text.push_str(text);
                 return;
             }
@@ -409,6 +548,17 @@ impl<'a> Builder<'a> {
             Event::Code(t) => {
                 let style = self.style();
                 self.spans.push(Span { text: t.to_string(), code: true, ..style });
+            }
+            Event::FootnoteReference(label) => {
+                let label = label.to_string();
+                let n = match self.foot_order.iter().position(|l| *l == label) {
+                    Some(p) => p + 1,
+                    None => {
+                        self.foot_order.push(label);
+                        self.foot_order.len()
+                    }
+                };
+                self.spans.push(Span { text: format!("[{n}]"), sup: true, link: Some(format!("#fn-{n}")), ..Span::default() });
             }
             Event::SoftBreak => self.push_text(" "),
             Event::HardBreak => self.spans.push(Span { br: true, ..Span::default() }),
@@ -541,6 +691,110 @@ fn strip_tags(raw: &str) -> String {
         .replace("&amp;", "&")
 }
 
+/// `:rocket:` -> 🚀 (the common GitHub shortcodes).
+fn emojify(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(':') {
+        return text.into();
+    }
+    const EMOJI: &[(&str, &str)] = &[
+        ("tada", "🎉"), ("rocket", "🚀"), ("sparkles", "✨"), ("bug", "🐛"), ("warning", "⚠"), ("white_check_mark", "✅"),
+        ("heavy_check_mark", "✔"), ("check", "✔"), ("x", "❌"), ("star", "⭐"), ("fire", "🔥"), ("zap", "⚡"), ("memo", "📝"),
+        ("book", "📖"), ("books", "📚"), ("bulb", "💡"), ("lock", "🔒"), ("package", "📦"), ("wrench", "🔧"), ("gear", "⚙"),
+        ("hammer", "🔨"), ("art", "🎨"), ("construction", "🚧"), ("heart", "❤"), ("+1", "👍"), ("-1", "👎"), ("thumbsup", "👍"),
+        ("thumbsdown", "👎"), ("smile", "😄"), ("grinning", "😀"), ("joy", "😂"), ("wink", "😉"), ("thinking", "🤔"),
+        ("eyes", "👀"), ("pray", "🙏"), ("clap", "👏"), ("muscle", "💪"), ("wave", "👋"), ("point_right", "👉"),
+        ("point_left", "👈"), ("information_source", "ℹ"), ("question", "❓"), ("exclamation", "❗"), ("bangbang", "‼"),
+        ("no_entry", "⛔"), ("stop_sign", "🛑"), ("link", "🔗"), ("mag", "🔍"), ("globe_with_meridians", "🌐"), ("computer", "💻"),
+        ("iphone", "📱"), ("keyboard", "⌨"), ("floppy_disk", "💾"), ("file_folder", "📁"), ("open_file_folder", "📂"),
+        ("calendar", "📅"), ("clock", "🕐"), ("hourglass", "⌛"), ("bell", "🔔"), ("key", "🔑"), ("shield", "🛡"),
+        ("trophy", "🏆"), ("medal", "🏅"), ("gift", "🎁"), ("coffee", "☕"), ("beer", "🍺"), ("pizza", "🍕"), ("cake", "🍰"),
+        ("sunny", "☀"), ("cloud", "☁"), ("snowflake", "❄"), ("umbrella", "☂"), ("earth_americas", "🌎"), ("seedling", "🌱"),
+        ("recycle", "♻"), ("arrow_right", "➡"), ("arrow_left", "⬅"), ("arrow_up", "⬆"), ("arrow_down", "⬇"),
+        ("rotating_light", "🚨"), ("boom", "💥"), ("100", "💯"), ("pushpin", "📌"), ("paperclip", "📎"), ("scissors", "✂"),
+        ("hammer_and_wrench", "🛠"), ("microscope", "🔬"), ("chart_with_upwards_trend", "📈"), ("bar_chart", "📊"),
+        ("dart", "🎯"), ("checkered_flag", "🏁"), ("flags", "🎏"), ("robot", "🤖"), ("ghost", "👻"), ("skull", "💀"),
+        ("poop", "💩"), ("party", "🥳"), ("sob", "😭"), ("sunglasses", "😎"), ("cry", "😢"), ("angry", "😠"),
+    ];
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(':') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let name_len = after.find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '-'))).unwrap_or(after.len());
+        let hit = (name_len > 0 && after[name_len..].starts_with(':'))
+            .then(|| EMOJI.iter().find(|(n, _)| *n == &after[..name_len]))
+            .flatten();
+        match hit {
+            Some((_, glyph)) => {
+                out.push_str(glyph);
+                rest = &after[name_len + 1..];
+            }
+            None => {
+                out.push(':');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.into()
+}
+
+/// Splits text into plain pieces and `http(s)://` addresses (without trailing punctuation).
+fn split_urls(text: &str) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = ["http://", "https://"].iter().filter_map(|p| rest.find(p)).min() {
+        // Only at a word start.
+        if i > 0 && !rest[..i].ends_with(|c: char| c.is_whitespace() || matches!(c, '(' | '<' | '"' | '\'')) {
+            out.push((rest[..i + 4].to_string(), None));
+            rest = &rest[i + 4..];
+            continue;
+        }
+        if i > 0 {
+            out.push((rest[..i].to_string(), None));
+        }
+        let tail = &rest[i..];
+        let mut end = tail.find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"')).unwrap_or(tail.len());
+        while end > 0 && tail[..end].ends_with(['.', ',', ';', ':', '!', '?', ')', '\'', ']']) {
+            // Keep a closing parenthesis that balances one inside the address.
+            if tail[..end].ends_with(')') && tail[..end].matches('(').count() >= tail[..end].matches(')').count() {
+                break;
+            }
+            end -= 1;
+        }
+        if end > "https://".len() - 1 {
+            let url = tail[..end].to_string();
+            out.push((url.clone(), Some(url)));
+            rest = &tail[end..];
+        } else {
+            out.push((tail[..4].to_string(), None));
+            rest = &tail[4..];
+        }
+    }
+    if !rest.is_empty() {
+        out.push((rest.to_string(), None));
+    }
+    out
+}
+
+/// A local .svg drawn on a transparent background (README logos and badges).
+fn load_local_svg(path: &Path) -> Option<egui::ColorImage> {
+    let data = std::fs::read(path).ok().filter(|d| d.len() < 8 << 20)?;
+    let mut options = resvg::usvg::Options::default();
+    options.resources_dir = path.parent().map(Path::to_path_buf);
+    if data.windows(5).any(|w| w == b"<text") {
+        std::sync::Arc::make_mut(&mut options.fontdb).load_system_fonts();
+    }
+    let tree = resvg::usvg::Tree::from_data(&data, &options).ok()?;
+    let (w, h) = (tree.size().width().max(1.0), tree.size().height().max(1.0));
+    // Twice the natural size keeps it sharp on high-DPI screens; always within sane bounds.
+    let scale = (2.0f32).min(1600.0 / w.max(h)).max(0.05);
+    let (pw, ph) = (((w * scale).round() as u32).max(1), ((h * scale).round() as u32).max(1));
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(pw, ph)?;
+    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    Some(egui::ColorImage::from_rgba_premultiplied([pw as usize, ph as usize], pixmap.data()))
+}
+
 fn load_local_image(base: &Path, url: &str) -> Option<egui::ColorImage> {
     if url.contains("://") || url.starts_with("data:") {
         return None;
@@ -552,6 +806,9 @@ fn load_local_image(base: &Path, url: &str) -> Option<egui::ColorImage> {
     let path = base.join(clean);
     if std::fs::metadata(&path).ok()?.len() > 32 << 20 {
         return None;
+    }
+    if path.extension().map_or(false, |e| e.eq_ignore_ascii_case("svg")) {
+        return load_local_svg(&path);
     }
     let mut img = image::ImageReader::open(&path).ok()?.with_guessed_format().ok()?.decode().ok()?;
     if img.width() > MAX_IMAGE_SIDE || img.height() > MAX_IMAGE_SIDE {
@@ -584,7 +841,13 @@ fn block_text(block: &MdBlock, out: &mut String) {
         }
         MdBlock::Quote { blocks, .. } => blocks.iter().for_each(|b| block_text(b, out)),
         MdBlock::List { items, .. } => items.iter().for_each(|item| item.blocks.iter().for_each(|b| block_text(b, out))),
-        MdBlock::Table { head, rows } => {
+        MdBlock::Details { summary, blocks, .. } => {
+            out.push_str(summary);
+            out.push('\n');
+            blocks.iter().for_each(|b| block_text(b, out));
+        }
+        MdBlock::Footnote { blocks, .. } => blocks.iter().for_each(|b| block_text(b, out)),
+        MdBlock::Table { head, rows, .. } => {
             for cell in head.iter().chain(rows.iter().flatten()) {
                 out.push_str(&spans_text(cell));
                 out.push(' ');
@@ -626,12 +889,15 @@ pub struct MarkdownView {
     textures: HashMap<String, egui::TextureHandle>,
     lines: Vec<String>,
     truncated: bool,
+    hl: crate::content::Colors,
     /// false = rendered preview, true = raw source.
     source: bool,
     /// Text size (Ctrl/Alt +/-, Ctrl+wheel, pinch).
     scale: f32,
     outline_open: bool,
     headings: Vec<Heading>,
+    /// (footnote number, top-level block index)
+    footnote_blocks: Vec<(usize, usize)>,
     block_texts: Vec<String>,
     find_open: bool,
     find_text: String,
@@ -655,14 +921,18 @@ struct Env<'a> {
 }
 
 impl MarkdownView {
-    pub fn new(ctx: &egui::Context, path: PathBuf, doc: MdDoc, lines: Vec<String>, truncated: bool) -> Self {
+    pub fn new(ctx: &egui::Context, path: PathBuf, doc: MdDoc, lines: Vec<String>, truncated: bool, hl: crate::content::Colors) -> Self {
         let mut headings = Vec::new();
+        let mut footnote_blocks = Vec::new();
         let mut block_texts = Vec::new();
         let mut seen: HashMap<String, usize> = HashMap::new();
         for (i, block) in doc.blocks.iter().enumerate() {
             let mut text = String::new();
             block_text(block, &mut text);
             block_texts.push(text.to_lowercase());
+            if let MdBlock::Footnote { n, .. } = block {
+                footnote_blocks.push((*n, i));
+            }
             if let MdBlock::Heading(level, spans) = block {
                 let text = spans_text(spans).trim().to_string();
                 let base = slugify(&text);
@@ -686,10 +956,12 @@ impl MarkdownView {
             textures,
             lines,
             truncated,
+            hl,
             source: false,
             scale: 1.0,
             outline_open: false,
             headings,
+            footnote_blocks,
             block_texts,
             find_open: false,
             find_text: String::new(),
@@ -797,7 +1069,7 @@ impl MarkdownView {
         ui.add_space(2.0);
 
         if self.source {
-            text_ui(ui, &self.lines);
+            text_ui(ui, &self.lines, self.hl.as_deref());
             return;
         }
 
@@ -967,7 +1239,12 @@ impl MarkdownView {
         let requested = self.goto.borrow_mut().take();
         if let Some(anchor) = requested {
             let key = anchor.to_lowercase();
-            if let Some(block) = self.headings.iter().find(|h| h.slug == key).map(|h| h.block) {
+            let footnote = key.strip_prefix("fn-").and_then(|n| n.parse::<usize>().ok());
+            let target = match footnote {
+                Some(n) => self.footnote_blocks.iter().find(|(num, _)| *num == n).map(|(_, b)| *b),
+                None => self.headings.iter().find(|h| h.slug == key).map(|h| h.block),
+            };
+            if let Some(block) = target {
                 self.scroll_to_block(block);
             }
         }
@@ -1099,24 +1376,68 @@ fn block_ui(ui: &mut egui::Ui, block: &MdBlock, env: Env) {
                 }
             }
         }
-        MdBlock::Table { head, rows } => {
+        MdBlock::Table { head, rows, align } => {
             let cols = head.len().max(rows.iter().map(|r| r.len()).max().unwrap_or(0)).max(1);
-            let col_w = (ui.available_width() / cols as f32).max(120.0);
+            // Column widths follow the content (like a browser), squeezed to fit when the table is too wide.
+            let font = FontId::proportional(BASE * env.scale);
+            let mut widths: Vec<f32> = (0..cols)
+                .map(|c| {
+                    let longest = head
+                        .get(c)
+                        .into_iter()
+                        .chain(rows.iter().filter_map(|r| r.get(c)))
+                        .map(|cell| {
+                            let text: String = spans_text(cell).chars().take(80).collect();
+                            ui.fonts(|f| f.layout_no_wrap(text, font.clone(), Color32::WHITE).size().x)
+                        })
+                        .fold(0.0f32, f32::max);
+                    (longest * 1.05 + 30.0).clamp(64.0, 520.0)
+                })
+                .collect();
+            let total: f32 = widths.iter().sum();
+            let avail = ui.available_width();
+            if total > avail {
+                let squeeze = (avail / total).max(0.45);
+                widths.iter_mut().for_each(|w| *w = (*w * squeeze).max(64.0));
+            }
             egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
                 egui::Grid::new("md_table").spacing([0.0, 0.0]).show(ui, |ui| {
                     if !head.is_empty() {
                         for c in 0..cols {
-                            cell_ui(ui, head.get(c), true, false, col_w, env);
+                            cell_ui(ui, head.get(c), true, false, widths[c], align.get(c).copied().unwrap_or(0), env);
                         }
                         ui.end_row();
                     }
                     for (r, row) in rows.iter().enumerate() {
                         for c in 0..cols {
-                            cell_ui(ui, row.get(c), false, r % 2 == 0, col_w, env);
+                            cell_ui(ui, row.get(c), false, r % 2 == 0, widths[c], align.get(c).copied().unwrap_or(0), env);
                         }
                         ui.end_row();
                     }
                 });
+            });
+        }
+        MdBlock::Details { summary, open, blocks } => {
+            egui::Frame::none()
+                .stroke(Stroke::new(1.0, BORDER))
+                .rounding(egui::Rounding::same(6.0))
+                .inner_margin(Margin::symmetric(12.0, 6.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    egui::CollapsingHeader::new(RichText::new(summary.as_str()).size(BASE * env.scale).strong().color(STRONG))
+                        .id_salt("md_details")
+                        .default_open(*open)
+                        .show(ui, |ui| {
+                            ui.add_space(4.0);
+                            blocks_ui(ui, blocks, env, false);
+                        });
+                });
+        }
+        MdBlock::Footnote { n, blocks } => {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(RichText::new(format!("{n}.")).size(BASE * 0.9 * env.scale).color(MUTED));
+                ui.vertical(|ui| blocks_ui(ui, blocks, Env { text: MUTED, scale: env.scale * 0.93, ..env }, true));
             });
         }
         MdBlock::Rule => {
@@ -1175,16 +1496,30 @@ fn marker_ui(ui: &mut egui::Ui, number: Option<u64>, task: Option<bool>, env: En
     );
 }
 
-fn cell_ui(ui: &mut egui::Ui, spans: Option<&Vec<Span>>, header: bool, shade: bool, col_w: f32, env: Env) {
+fn cell_ui(ui: &mut egui::Ui, spans: Option<&Vec<Span>>, header: bool, shade: bool, col_w: f32, align: u8, env: Env) {
     let fill = if shade { CODE_BG } else { Color32::TRANSPARENT };
     egui::Frame::none()
         .fill(fill)
         .stroke(Stroke::new(1.0, BORDER))
         .inner_margin(Margin::symmetric(12.0, 6.0))
         .show(ui, |ui| {
-            ui.set_max_width((col_w - 25.0).max(60.0));
+            ui.set_width((col_w - 25.0).max(40.0));
+            ui.set_min_height(BASE * env.scale * 1.45 + 4.0);
+            ui.spacing_mut().item_spacing.y = 0.0;
             match spans {
-                Some(spans) => inline_ui(ui, spans, BASE * env.scale, if header { STRONG } else { env.text }, env),
+                Some(spans) => {
+                    let size = BASE * env.scale;
+                    // Centre / right alignment: push single-line text over by the free space.
+                    let indent = if align == 0 {
+                        0.0
+                    } else {
+                        let text = spans_text(spans);
+                        let width = ui.fonts(|f| f.layout_no_wrap(text, FontId::proportional(size), Color32::WHITE).size().x);
+                        let free = (ui.available_width() - width - 2.0).max(0.0);
+                        if align == 1 { free / 2.0 } else { free }
+                    };
+                    inline_ui_indented(ui, spans, size, if header { STRONG } else { env.text }, env, indent)
+                }
                 None => {
                     ui.label("");
                 }
@@ -1194,9 +1529,16 @@ fn cell_ui(ui: &mut egui::Ui, spans: Option<&Vec<Span>>, header: bool, shade: bo
 
 /// One paragraph of mixed text: wraps across runs; links are clickable.
 fn inline_ui(ui: &mut egui::Ui, spans: &[Span], size: f32, color: Color32, env: Env) {
+    inline_ui_indented(ui, spans, size, color, env, 0.0)
+}
+
+fn inline_ui_indented(ui: &mut egui::Ui, spans: &[Span], size: f32, color: Color32, env: Env, indent: f32) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(0.0, 4.0);
         ui.set_row_height(size * 1.45);
+        if indent > 0.5 {
+            ui.add_space(indent);
+        }
         for span in spans {
             if span.br {
                 ui.end_row();
@@ -1215,6 +1557,9 @@ fn inline_ui(ui: &mut egui::Ui, spans: &[Span], size: f32, color: Color32, env: 
                 };
                 text.size(size).color(c)
             };
+            if span.sup {
+                text = text.small_raised();
+            }
             if span.italic {
                 text = text.italics();
             }
@@ -1238,4 +1583,68 @@ fn inline_ui(ui: &mut egui::Ui, spans: &[Span], size: f32, color: Color32, env: 
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(text: &str) -> Vec<MdBlock> {
+        parse(text, Path::new("/tmp/x.md")).blocks
+    }
+
+    fn para_text(b: &MdBlock) -> String {
+        match b {
+            MdBlock::Para(s) | MdBlock::Heading(_, s) => spans_text(s),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn emoji_and_urls() {
+        assert_eq!(emojify("Ship it :rocket: now :nope: 12:30:45"), "Ship it 🚀 now :nope: 12:30:45");
+        let parts = split_urls("see https://a.b/c_(d), and http://x.y.");
+        let urls: Vec<_> = parts.iter().filter_map(|(_, u)| u.clone()).collect();
+        assert_eq!(urls, vec!["https://a.b/c_(d)", "http://x.y"]);
+        let b = doc("Go to https://example.com/path now");
+        match &b[0] {
+            MdBlock::Para(s) => assert!(s.iter().any(|x| x.link.as_deref() == Some("https://example.com/path"))),
+            _ => panic!("para"),
+        }
+        // An explicit link is not linkified twice.
+        match &doc("[https://x.y](https://x.y)")[0] {
+            MdBlock::Para(s) => assert_eq!(s.len(), 1),
+            _ => panic!("para"),
+        }
+    }
+
+    #[test]
+    fn tables_footnotes() {
+        let b = doc("| a | b | c |\n|:--|:-:|--:|\n| 1 | 2 | 3 |\n\nText[^1] more[^2].\n\n[^2]: Second\n[^1]: First\n");
+        match &b[0] {
+            MdBlock::Table { align, .. } => assert_eq!(align, &vec![0, 1, 2]),
+            _ => panic!("table"),
+        }
+        assert!(para_text(&b[1]).contains("[1]") && para_text(&b[1]).contains("[2]"));
+        let notes: Vec<usize> = b.iter().filter_map(|x| if let MdBlock::Footnote { n, .. } = x { Some(*n) } else { None }).collect();
+        assert_eq!(notes, vec![1, 2]);
+    }
+
+    #[test]
+    fn details() {
+        // One block (no blank lines) and the multi-block form.
+        let one = doc("<details><summary>More</summary>hidden text</details>\n");
+        assert!(matches!(&one[0], MdBlock::Details { summary, blocks, .. } if summary == "More" && blocks.len() == 1));
+        let many = doc("<details open>\n<summary>Title</summary>\n\nA **list**:\n\n- one\n- two\n\n</details>\n\nAfter\n");
+        match &many[0] {
+            MdBlock::Details { summary, open, blocks } => {
+                assert_eq!(summary, "Title");
+                assert!(*open);
+                assert_eq!(blocks.len(), 2);
+            }
+            _ => panic!("details"),
+        }
+        assert_eq!(para_text(&many[1]), "After");
+        assert_eq!(many.len(), 2);
+    }
 }

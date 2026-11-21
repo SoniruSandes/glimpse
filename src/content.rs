@@ -1,6 +1,7 @@
 //! What the preview shows, and how each file type is loaded (background thread) and drawn (UI thread).
 
 use std::{
+    sync::Arc,
     collections::{HashMap, HashSet},
     fs::File,
     io::Read,
@@ -12,7 +13,11 @@ use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Rect, RichText, Se
 use egui_extras::{Column, TableBuilder};
 
 use crate::{
+    aep::{self, AepInfo},
+    highlight,
+    appinfo::{self, AppInfo},
     archive::{self, Entry, Listing},
+    cards::{AepView, AppView},
     folder::{self, FolderListing},
     htmlview::HtmlView,
     icons,
@@ -51,9 +56,9 @@ pub fn human_size(bytes: u64) -> String {
 
 pub enum Loaded {
     Image(egui::ColorImage),
-    Text { lines: Vec<String>, truncated: bool },
-    Html { path: PathBuf, lines: Vec<String>, truncated: bool },
-    Markdown { path: PathBuf, doc: markdown::MdDoc, lines: Vec<String>, truncated: bool },
+    Text { lines: Vec<String>, truncated: bool, hl: Colors },
+    Html { path: PathBuf, lines: Vec<String>, truncated: bool, hl: Colors },
+    Markdown { path: PathBuf, doc: markdown::MdDoc, lines: Vec<String>, truncated: bool, hl: Colors },
     Pdf(PdfLoaded),
     PdfLocked { path: PathBuf },
     Folder(FolderListing),
@@ -63,6 +68,8 @@ pub enum Loaded {
     Archive(Listing),
     Media { path: PathBuf, video: bool },
     Model(Box<model::ModelData>),
+    App(Box<AppInfo>),
+    Aep(Box<AepInfo>),
     /// An image together with the other images in its folder (Left/Right to browse).
     Gallery { first: Box<Loaded>, files: Vec<PathBuf>, index: usize },
     Unsupported(String),
@@ -90,6 +97,10 @@ pub fn load(path: &Path, ctx: &egui::Context) -> Loaded {
     if IMAGE_EXTS.contains(&ext) {
         return load_image(path);
     }
+    // ".ts" is both MPEG transport-stream video and TypeScript source: video has a sync byte every 188 bytes.
+    if ext == "ts" && !looks_like_mpeg_ts(path) {
+        return load_text(path);
+    }
     if media::VIDEO_EXTS.contains(&ext) {
         return Loaded::Media { path: path.to_path_buf(), video: true };
     }
@@ -112,6 +123,9 @@ pub fn load(path: &Path, ctx: &egui::Context) -> Loaded {
             }
         }
         "psd" => load_psd(path),
+        "aep" => failed(aep::load(path), |i| Loaded::Aep(Box::new(i))),
+        "exe" => failed(appinfo::load(path), |i| Loaded::App(Box::new(i))),
+        "lnk" => load_lnk(path, ctx),
         "psb" => Loaded::Unsupported("Photoshop Large Document (.psb) isn't supported yet.".into()),
         "docx" | "docm" => failed(office::load_docx(path), Loaded::Doc),
         "pptx" | "pptm" => failed(office::load_pptx(path), Loaded::Slides),
@@ -119,13 +133,13 @@ pub fn load(path: &Path, ctx: &egui::Context) -> Loaded {
         "csv" | "tsv" => failed(office::load_csv(path, ext == "tsv"), Loaded::Table),
         "svg" | "svgz" => load_svg(path),
         "html" | "htm" | "xhtml" => match load_text(path) {
-            Loaded::Text { lines, truncated } => Loaded::Html { path: path.to_path_buf(), lines, truncated },
+            Loaded::Text { lines, truncated, hl } => Loaded::Html { path: path.to_path_buf(), lines, truncated, hl },
             other => other,
         },
         "md" | "markdown" | "mdown" | "mkd" => match load_text(path) {
-            Loaded::Text { lines, truncated } => {
+            Loaded::Text { lines, truncated, hl } => {
                 let doc = markdown::parse(&lines.join("\n"), path);
-                Loaded::Markdown { path: path.to_path_buf(), doc, lines, truncated }
+                Loaded::Markdown { path: path.to_path_buf(), doc, lines, truncated, hl }
             }
             other => other,
         },
@@ -138,6 +152,24 @@ pub fn load(path: &Path, ctx: &egui::Context) -> Loaded {
             }
             load_text(path)
         }
+    }
+}
+
+fn looks_like_mpeg_ts(path: &Path) -> bool {
+    let mut head = Vec::with_capacity(400);
+    let Ok(file) = File::open(path) else { return true };
+    if file.take(400).read_to_end(&mut head).is_err() {
+        return true;
+    }
+    head.first() == Some(&0x47) && (head.len() <= 188 || head[188] == 0x47)
+}
+
+/// A shortcut opened directly (the tray normally resolves it first): preview what it points to.
+fn load_lnk(path: &Path, ctx: &egui::Context) -> Loaded {
+    match crate::shortcut::target(path) {
+        Some(target) if target.exists() => load(&target, ctx),
+        Some(target) => Loaded::Failed(format!("The shortcut's target can't be found:\n{}", target.display())),
+        None => Loaded::Unsupported("This shortcut doesn't point to a file on this computer".into()),
     }
 }
 
@@ -356,7 +388,11 @@ fn load_text(path: &Path) -> Loaded {
         lines.truncate(MAX_TEXT_LINES);
         truncated = true;
     }
-    Loaded::Text { lines, truncated }
+    // Code files get colours (computed here, off the UI thread, so multi-line comments / strings work).
+    let hl = highlight::language_for_path(path)
+        .and_then(|lang| highlight::Highlighted::build(lang, &lines))
+        .map(Arc::new);
+    Loaded::Text { lines, truncated, hl }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -424,7 +460,7 @@ fn chip(icon: &'static str, text: impl Into<String>) -> Chip {
 pub enum Content {
     Loading,
     Image(ImageView),
-    Text { lines: Vec<String>, truncated: bool },
+    Text { lines: Vec<String>, truncated: bool, hl: Colors },
     Html(Box<HtmlView>),
     Markdown(Box<MarkdownView>),
     Pdf(Box<PdfView>),
@@ -436,6 +472,8 @@ pub enum Content {
     Archive(Box<ArchiveView>),
     Media(Box<MediaView>),
     Model(Box<ModelView>),
+    App(Box<AppView>),
+    Aep(Box<AepView>),
     Gallery(Box<GalleryView>),
     Unsupported(String),
     Failed(String),
@@ -449,10 +487,10 @@ impl Content {
                 let tex = ctx.load_texture("preview", img, egui::TextureOptions::LINEAR);
                 Content::Image(ImageView { tex, size, zoom: 1.0, pan: egui::Vec2::ZERO, scale: 1.0 })
             }
-            Loaded::Text { lines, truncated } => Content::Text { lines, truncated },
-            Loaded::Html { path, lines, truncated } => Content::Html(Box::new(HtmlView::new(path, lines, truncated))),
-            Loaded::Markdown { path, doc, lines, truncated } => {
-                Content::Markdown(Box::new(MarkdownView::new(ctx, path, doc, lines, truncated)))
+            Loaded::Text { lines, truncated, hl } => Content::Text { lines, truncated, hl },
+            Loaded::Html { path, lines, truncated, hl } => Content::Html(Box::new(HtmlView::new(path, lines, truncated, hl))),
+            Loaded::Markdown { path, doc, lines, truncated, hl } => {
+                Content::Markdown(Box::new(MarkdownView::new(ctx, path, doc, lines, truncated, hl)))
             }
             Loaded::Pdf(p) => Content::Pdf(Box::new(PdfView::new(p))),
             Loaded::PdfLocked { path } => Content::PdfLocked(Box::new(PdfLockView::new(path))),
@@ -471,6 +509,8 @@ impl Content {
                 Err(e) => Content::Failed(e),
             },
             Loaded::Model(data) => Content::Model(Box::new(ModelView::new(*data))),
+            Loaded::App(info) => Content::App(Box::new(AppView::new(ctx, *info))),
+            Loaded::Aep(info) => Content::Aep(Box::new(AepView::new(*info))),
             Loaded::Unsupported(msg) => Content::Unsupported(msg),
             Loaded::Failed(e) => Content::Failed(e),
         }
@@ -480,6 +520,40 @@ impl Content {
     pub fn set_embedded(&mut self) {
         if let Content::Model(m) = self {
             m.set_embedded();
+        }
+    }
+
+    /// The program card is a small window of its own: no footer.
+    pub fn hides_status_bar(&self) -> bool {
+        matches!(self, Content::App(_))
+    }
+
+    /// Extra controls at the right end of the status bar (the texture menu of a 3D model, also when the model
+    /// is shown inside a folder or archive preview).
+    pub fn footer_ui(&mut self, ui: &mut egui::Ui) {
+        match self {
+            Content::Model(m) => m.footer_ui(ui),
+            Content::Archive(a) => {
+                if let Some(pane) = a.child.as_mut() {
+                    pane.content.footer_ui(ui);
+                }
+            }
+            Content::Folder(f) => {
+                if let Some(pane) = f.child.as_mut() {
+                    pane.content.footer_ui(ui);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A native dialog is open (the window must not close itself because it lost focus).
+    pub fn modal_busy(&self) -> bool {
+        match self {
+            Content::Model(m) => m.modal_busy(),
+            Content::Archive(a) => a.child.as_ref().map_or(false, |p| p.content.modal_busy()),
+            Content::Folder(f) => f.child.as_ref().map_or(false, |p| p.content.modal_busy()),
+            _ => false,
         }
     }
 
@@ -506,7 +580,7 @@ impl Content {
                 chip(icons::ARROWS_OUT, format!("{} × {}", v.size[0], v.size[1])),
                 chip(icons::MAGNIFYING_GLASS, format!("{:.0}%", v.scale * 100.0)),
             ],
-            Content::Text { lines, truncated } => {
+            Content::Text { lines, truncated, .. } => {
                 let mut chips = vec![chip(icons::LIST_NUMBERS, format!("{} lines", lines.len()))];
                 if *truncated {
                     chips.push(chip(icons::WARNING, "Truncated"));
@@ -522,6 +596,8 @@ impl Content {
             Content::Slides(s) => vec![chip(icons::PRESENTATION_CHART, format!("{} slides", s.slides.len()))],
             Content::Media(m) => vec![chip(icons::CLOCK, m.status())],
             Content::Model(m) => m.chips().into_iter().map(|(icon, text)| chip(icon, text)).collect(),
+            Content::App(a) => a.chips(),
+            Content::Aep(a) => a.chips(),
             Content::Gallery(g) => g.current.content.chips(),
             Content::Archive(a) => {
                 let mut chips = vec![chip(
@@ -553,7 +629,7 @@ impl Content {
                 ui.centered_and_justified(|ui| ui.label(RichText::new("Loading…").weak()));
             }
             Content::Image(view) => view.ui(ui),
-            Content::Text { lines, .. } => text_ui(ui, lines),
+            Content::Text { lines, hl, .. } => text_ui(ui, lines, hl.as_deref()),
             Content::Html(html) => html.ui(ui),
             Content::Markdown(md) => md.ui(ui),
             Content::Pdf(view) => view.ui(ui),
@@ -571,6 +647,8 @@ impl Content {
             Content::Archive(archive) => archive.ui(ui),
             Content::Media(media) => media.ui(ui),
             Content::Model(model) => model.ui(ui),
+            Content::App(app) => app.ui(ui),
+            Content::Aep(aep) => aep.ui(ui),
             Content::Gallery(gallery) => gallery.ui(ui),
             Content::Unsupported(msg) => notice(ui, icons::FILE, Color32::from_gray(150), msg, None),
             Content::Failed(error) => notice(
@@ -722,7 +800,10 @@ impl ImageView {
 
 // ---- text ----
 
-pub(crate) fn text_ui(ui: &mut egui::Ui, lines: &[String]) {
+/// Optional syntax colours for a text view.
+pub type Colors = Option<Arc<highlight::Highlighted>>;
+
+pub(crate) fn text_ui(ui: &mut egui::Ui, lines: &[String], hl: Option<&highlight::Highlighted>) {
     if lines.is_empty() {
         ui.centered_and_justified(|ui| ui.weak("(empty file)"));
         return;
@@ -731,8 +812,14 @@ pub(crate) fn text_ui(ui: &mut egui::Ui, lines: &[String]) {
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show_rows(ui, row_height, lines.len(), |ui, range| {
-            for line in &lines[range] {
-                ui.add(egui::Label::new(RichText::new(line).monospace()).wrap_mode(egui::TextWrapMode::Extend));
+            let size = ui.text_style_height(&TextStyle::Monospace) * 0.92;
+            let base = ui.visuals().text_color();
+            for i in range {
+                let label = match hl {
+                    Some(hl) => egui::Label::new(hl.line_job(i, &lines[i], size, base)),
+                    None => egui::Label::new(RichText::new(&lines[i]).monospace()),
+                };
+                ui.add(label.wrap_mode(egui::TextWrapMode::Extend));
             }
         });
 }
